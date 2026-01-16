@@ -198,7 +198,7 @@ compiledGraph.Invoke(ctx, input, WithCallbacks(handler).DesignateNode("node_1"))
 ## 强大的编排 (Graph/Chain/Workflow)
 
 - 数据从 Retriever / Document Loader / ChatTemplate 流向 ChatModel，接着流向 Tool ，并被解析为最终答案。这种通过多个组件的有向、可控的数据流，可以通过**图编排**来实现。
-- 组件实例是图的**节点（Node）**，而**边（Edge）**则是数据流通道。
+- 组件实例是图的 **节点（Node）** ，而 **边（Edge）** 则是数据流通道。
 - 图编排功能强大且足够灵活，能够实现复杂的业务逻辑：
     - **类型检查、流处理、并发管理、切面注入和选项分配**都由框架处理。
     - 在运行时进行**分支（Branch）**执行、读写全局**状态（State）**，或者使用工作流进行字段级别的数据映射。
@@ -246,6 +246,19 @@ Eino 框架由几个部分组成：
 
 ## 依赖说明
 - Go 1.18 及以上版本
+
+## 代码规范
+
+本仓库开启了 `golangci-lint` 检查以约束基础代码规范，可通过以下命令在本地检查：
+
+```bash
+golangci-lint run ./...
+```
+
+主要规则包括：
+- 导出的函数、接口、package 等需要添加注释，且注释符合 GoDoc 规范。
+- 代码格式需符合 `gofmt -s` 规范。
+- import 顺序需符合 `goimports` 规范（std -> third party -> local）。
 
 ## 安全
 

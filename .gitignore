@@ -39,3 +39,7 @@ output/*
 
 /vendor
 
+# Trae files
+.trae
+
+.DS_Store

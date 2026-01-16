@@ -806,8 +806,14 @@ func (g *graph) compile(ctx context.Context, opt *graphCompileOptions) (*composa
 
 	if g.stateGenerator != nil {
 		r.runCtx = func(ctx context.Context) context.Context {
+			var parent *internalState
+			if p, ok := ctx.Value(stateKey{}).(*internalState); ok {
+				parent = p
+			}
+
 			return context.WithValue(ctx, stateKey{}, &internalState{
-				state: g.stateGenerator(ctx),
+				state:  g.stateGenerator(ctx),
+				parent: parent,
 			})
 		}
 	}
@@ -859,7 +865,20 @@ func getSuccessors(c *chanCall) []string {
 			ret = append(ret, node)
 		}
 	}
-	return ret
+	return uniqueSlice(ret)
+}
+
+func uniqueSlice(s []string) []string {
+	seen := make(map[string]struct{}, len(s))
+	cur := 0
+	for i := range s {
+		if _, ok := seen[s[i]]; !ok {
+			seen[s[i]] = struct{}{}
+			s[cur] = s[i]
+			cur++
+		}
+	}
+	return s[:cur]
 }
 
 type subGraphCompileCallback struct {
@@ -1071,6 +1090,7 @@ func validateDAG(chanSubscribeTo map[string]*chanCall, controlPredecessors map[s
 	return nil
 }
 
+// DAGInvalidLoopErr indicates the graph contains a cycle and is invalid.
 var DAGInvalidLoopErr = errors.New("DAG is invalid, has loop")
 
 func findLoops(startNodes []string, chanCalls map[string]*chanCall) [][]string {
@@ -1153,10 +1173,12 @@ func NewNodePath(nodeKeyPath ...string) *NodePath {
 	return &NodePath{path: nodeKeyPath}
 }
 
+// NodePath represents a path composed of node keys to locate a node.
 type NodePath struct {
 	path []string
 }
 
+// GetPath returns the sequence of node keys in the path.
 func (p *NodePath) GetPath() []string {
 	return p.path
 }

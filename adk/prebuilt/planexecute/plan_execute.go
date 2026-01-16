@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+// Package planexecute implements a plan–execute–replan style agent.
 package planexecute
 
 import (
@@ -24,14 +25,20 @@ import (
 	"strings"
 
 	"github.com/bytedance/sonic"
-	"github.com/cloudwego/eino/compose"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/prompt"
+	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/internal/safe"
 	"github.com/cloudwego/eino/schema"
 )
+
+func init() {
+	schema.RegisterName[*defaultPlan]("_eino_adk_plan_execute_default_plan")
+	schema.RegisterName[ExecutedStep]("_eino_adk_plan_execute_executed_step")
+	schema.RegisterName[[]ExecutedStep]("_eino_adk_plan_execute_executed_steps")
+}
 
 // Plan represents an execution plan with a sequence of actionable steps.
 // It supports JSON serialization and deserialization while providing access to the first step.
@@ -104,7 +111,7 @@ var (
 	// PlanToolInfo defines the schema for the Plan tool that can be used with ToolCallingChatModel.
 	// This schema instructs the model to generate a structured plan with ordered steps.
 	PlanToolInfo = schema.ToolInfo{
-		Name: "Plan",
+		Name: "plan",
 		Desc: "Plan with a list of steps to execute in order. Each step should be clear, actionable, and arranged in a logical sequence. The output will be used to guide the execution process.",
 		ParamsOneOf: schema.NewParamsOneOfByParams(
 			map[string]*schema.ParameterInfo{
@@ -121,7 +128,7 @@ var (
 	// RespondToolInfo defines the schema for the response tool that can be used with ToolCallingChatModel.
 	// This schema instructs the model to generate a direct response to the user.
 	RespondToolInfo = schema.ToolInfo{
-		Name: "Respond",
+		Name: "respond",
 		Desc: "Generate a direct response to the user. Use this tool when you have all the information needed to provide a final answer.",
 		ParamsOneOf: schema.NewParamsOneOfByParams(
 			map[string]*schema.ParameterInfo{
@@ -299,7 +306,7 @@ type planner struct {
 }
 
 func (p *planner) Name(_ context.Context) string {
-	return "Planner"
+	return "planner"
 }
 
 func (p *planner) Description(_ context.Context) string {
@@ -379,6 +386,9 @@ func (p *planner) Run(ctx context.Context, input *adk.AgentInput,
 				compose.InvokableLambda(func(ctx context.Context, msg adk.Message) (plan Plan, err error) {
 					var planJSON string
 					if p.toolCall {
+						if len(msg.ToolCalls) == 0 {
+							return nil, fmt.Errorf("no tool call")
+						}
 						planJSON = msg.ToolCalls[0].Function.Arguments
 					} else {
 						planJSON = msg.Content
@@ -536,7 +546,7 @@ func NewExecutor(ctx context.Context, cfg *ExecutorConfig) (adk.Agent, error) {
 	}
 
 	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:          "Executor",
+		Name:          "executor",
 		Description:   "an executor agent",
 		Model:         cfg.Model,
 		ToolsConfig:   cfg.ToolsConfig,
@@ -624,7 +634,7 @@ func formatExecutedSteps(results []ExecutedStep) string {
 }
 
 func (r *replanner) Name(_ context.Context) string {
-	return "Replanner"
+	return "replanner"
 }
 
 func (r *replanner) Description(_ context.Context) string {
@@ -790,6 +800,8 @@ func buildGenReplannerInputFn(planToolName, respondToolName string) GenModelInpu
 	}
 }
 
+// NewReplanner creates a plan-execute-replan agent wired with plan and respond tools.
+// It configures the provided ToolCallingChatModel with the tools and returns an Agent.
 func NewReplanner(_ context.Context, cfg *ReplannerConfig) (adk.Agent, error) {
 	planTool := cfg.PlanTool
 	if planTool == nil {
@@ -845,7 +857,7 @@ type Config struct {
 // 2. Execution: Execute the first step of the plan
 // 3. Replanning: Evaluate progress and either complete the task or revise the plan
 // This approach enables complex problem-solving through iterative refinement.
-func New(ctx context.Context, cfg *Config) (adk.Agent, error) {
+func New(ctx context.Context, cfg *Config) (adk.ResumableAgent, error) {
 	maxIterations := cfg.MaxIterations
 	if maxIterations <= 0 {
 		maxIterations = 10

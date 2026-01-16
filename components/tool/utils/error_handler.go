@@ -20,9 +20,11 @@ import (
 	"context"
 
 	"github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 )
 
+// ErrorHandler converts a tool error into a string response.
 type ErrorHandler func(context.Context, error) string
 
 // WrapToolWithErrorHandler wraps any BaseTool with custom error handling.
@@ -138,6 +140,9 @@ type errorHelper struct {
 
 func (s *errorHelper) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
 	result, err := s.i(ctx, argumentsInJSON, opts...)
+	if _, ok := compose.IsInterruptRerunError(err); ok {
+		return result, err
+	}
 	if err != nil {
 		return s.h(ctx, err), nil
 	}
@@ -151,6 +156,9 @@ type streamErrorHelper struct {
 
 func (s *streamErrorHelper) StreamableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (*schema.StreamReader[string], error) {
 	result, err := s.s(ctx, argumentsInJSON, opts...)
+	if _, ok := compose.IsInterruptRerunError(err); ok {
+		return result, err
+	}
 	if err != nil {
 		return schema.StreamReaderFromArray([]string{s.h(ctx, err)}), nil
 	}

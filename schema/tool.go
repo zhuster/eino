@@ -17,6 +17,8 @@
 package schema
 
 import (
+	"sort"
+
 	"github.com/eino-contrib/jsonschema"
 	orderedmap "github.com/wk8/go-ordered-map/v2"
 )
@@ -25,6 +27,7 @@ import (
 // It must be one of the following values: "object", "number", "integer", "string", "array", "null", "boolean", which is the same as the type of the parameter in JSONSchema.
 type DataType string
 
+// Supported JSONSchema data types for tool parameters.
 const (
 	Object  DataType = "object"
 	Number  DataType = "number"
@@ -126,7 +129,13 @@ func (p *ParamsOneOf) ToJSONSchema() (*jsonschema.Schema, error) {
 			Required:   make([]string, 0, len(p.params)),
 		}
 
+		keys := make([]string, 0, len(p.params))
 		for k := range p.params {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		for _, k := range keys {
 			v := p.params[k]
 			sc.Properties.Set(k, paramInfoToJSONSchema(v))
 			if v.Required {
@@ -160,7 +169,14 @@ func paramInfoToJSONSchema(paramInfo *ParameterInfo) *jsonschema.Schema {
 	if len(paramInfo.SubParams) > 0 {
 		required := make([]string, 0, len(paramInfo.SubParams))
 		js.Properties = orderedmap.New[string, *jsonschema.Schema]()
-		for k, v := range paramInfo.SubParams {
+		keys := make([]string, 0, len(paramInfo.SubParams))
+		for k := range paramInfo.SubParams {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		for _, k := range keys {
+			v := paramInfo.SubParams[k]
 			item := paramInfoToJSONSchema(v)
 			js.Properties.Set(k, item)
 			if v.Required {

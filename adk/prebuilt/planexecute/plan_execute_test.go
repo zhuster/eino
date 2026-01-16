@@ -18,6 +18,8 @@ package planexecute
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/bytedance/sonic"
@@ -26,6 +28,8 @@ import (
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/compose"
 	mockAdk "github.com/cloudwego/eino/internal/mock/adk"
 	mockModel "github.com/cloudwego/eino/internal/mock/components/model"
 	"github.com/cloudwego/eino/schema"
@@ -53,7 +57,7 @@ func TestNewPlannerWithFormattedOutput(t *testing.T) {
 	assert.NotNil(t, p)
 
 	// Verify the planner's name and description
-	assert.Equal(t, "Planner", p.Name(ctx))
+	assert.Equal(t, "planner", p.Name(ctx))
 	assert.Equal(t, "a planner agent", p.Description(ctx))
 }
 
@@ -81,7 +85,7 @@ func TestNewPlannerWithToolCalling(t *testing.T) {
 	assert.NotNil(t, p)
 
 	// Verify the planner's name and description
-	assert.Equal(t, "Planner", p.Name(ctx))
+	assert.Equal(t, "planner", p.Name(ctx))
 	assert.Equal(t, "a planner agent", p.Description(ctx))
 }
 
@@ -157,7 +161,7 @@ func TestPlannerRunWithToolCalling(t *testing.T) {
 		ID:   "tool_call_id",
 		Type: "function",
 		Function: schema.FunctionCall{
-			Name:      "Plan", // This should match PlanToolInfo.Name
+			Name:      "plan", // This should match PlanToolInfo.Name
 			Arguments: planArgs,
 		},
 	}
@@ -234,7 +238,7 @@ func TestNewExecutor(t *testing.T) {
 	assert.NotNil(t, executor)
 
 	// Verify the executor's name and description
-	assert.Equal(t, "Executor", executor.Name(ctx))
+	assert.Equal(t, "executor", executor.Name(ctx))
 	assert.Equal(t, "an executor agent", executor.Description(ctx))
 }
 
@@ -338,7 +342,7 @@ func TestNewReplanner(t *testing.T) {
 	assert.NotNil(t, rp)
 
 	// Verify the replanner's name and description
-	assert.Equal(t, "Replanner", rp.Name(ctx))
+	assert.Equal(t, "replanner", rp.Name(ctx))
 	assert.Equal(t, "a replanner agent", rp.Description(ctx))
 }
 
@@ -544,13 +548,13 @@ func TestNewPlanExecuteAgent(t *testing.T) {
 	mockReplanner := mockAdk.NewMockAgent(ctrl)
 
 	// Set up expectations for the mock agents
-	mockPlanner.EXPECT().Name(gomock.Any()).Return("Planner").AnyTimes()
+	mockPlanner.EXPECT().Name(gomock.Any()).Return("planner").AnyTimes()
 	mockPlanner.EXPECT().Description(gomock.Any()).Return("a planner agent").AnyTimes()
 
-	mockExecutor.EXPECT().Name(gomock.Any()).Return("Executor").AnyTimes()
+	mockExecutor.EXPECT().Name(gomock.Any()).Return("executor").AnyTimes()
 	mockExecutor.EXPECT().Description(gomock.Any()).Return("an executor agent").AnyTimes()
 
-	mockReplanner.EXPECT().Name(gomock.Any()).Return("Replanner").AnyTimes()
+	mockReplanner.EXPECT().Name(gomock.Any()).Return("replanner").AnyTimes()
 	mockReplanner.EXPECT().Description(gomock.Any()).Return("a replanner agent").AnyTimes()
 
 	conf := &Config{
@@ -578,13 +582,13 @@ func TestPlanExecuteAgentWithReplan(t *testing.T) {
 	mockReplanner := mockAdk.NewMockAgent(ctrl)
 
 	// Set up expectations for the mock agents
-	mockPlanner.EXPECT().Name(gomock.Any()).Return("Planner").AnyTimes()
+	mockPlanner.EXPECT().Name(gomock.Any()).Return("planner").AnyTimes()
 	mockPlanner.EXPECT().Description(gomock.Any()).Return("a planner agent").AnyTimes()
 
-	mockExecutor.EXPECT().Name(gomock.Any()).Return("Executor").AnyTimes()
+	mockExecutor.EXPECT().Name(gomock.Any()).Return("executor").AnyTimes()
 	mockExecutor.EXPECT().Description(gomock.Any()).Return("an executor agent").AnyTimes()
 
-	mockReplanner.EXPECT().Name(gomock.Any()).Return("Replanner").AnyTimes()
+	mockReplanner.EXPECT().Name(gomock.Any()).Return("replanner").AnyTimes()
 	mockReplanner.EXPECT().Description(gomock.Any()).Return("a replanner agent").AnyTimes()
 
 	// Create a plan
@@ -719,4 +723,282 @@ func TestPlanExecuteAgentWithReplan(t *testing.T) {
 		assert.NoError(t, e)
 		t.Logf("event %d:\n%s", i, eventJSON)
 	}
+}
+
+type interruptibleTool struct {
+	name string
+	t    *testing.T
+}
+
+func (m *interruptibleTool) Info(_ context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{
+		Name: m.name,
+		Desc: "A tool that requires human approval before execution",
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"action": {
+				Type:     schema.String,
+				Desc:     "The action to perform",
+				Required: true,
+			},
+		}),
+	}, nil
+}
+
+func (m *interruptibleTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
+	wasInterrupted, _, _ := compose.GetInterruptState[any](ctx)
+	if !wasInterrupted {
+		return "", compose.Interrupt(ctx, fmt.Sprintf("Tool '%s' requires human approval", m.name))
+	}
+
+	isResumeTarget, hasData, data := compose.GetResumeContext[string](ctx)
+	if !isResumeTarget {
+		return "", compose.Interrupt(ctx, fmt.Sprintf("Tool '%s' requires human approval", m.name))
+	}
+
+	if hasData {
+		return fmt.Sprintf("Approved action executed with data: %s", data), nil
+	}
+	return "Approved action executed", nil
+}
+
+type checkpointStore struct {
+	data map[string][]byte
+}
+
+func newCheckpointStore() *checkpointStore {
+	return &checkpointStore{data: make(map[string][]byte)}
+}
+
+func (s *checkpointStore) Set(_ context.Context, key string, value []byte) error {
+	s.data[key] = value
+	return nil
+}
+
+func (s *checkpointStore) Get(_ context.Context, key string) ([]byte, bool, error) {
+	v, ok := s.data[key]
+	return v, ok, nil
+}
+
+func formatRunPath(runPath []adk.RunStep) string {
+	if len(runPath) == 0 {
+		return "[]"
+	}
+	var parts []string
+	for _, step := range runPath {
+		parts = append(parts, step.String())
+	}
+	return "[" + strings.Join(parts, " -> ") + "]"
+}
+
+func formatAgentEvent(event *adk.AgentEvent) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("{AgentName: %q, RunPath: %s", event.AgentName, formatRunPath(event.RunPath)))
+	if event.Output != nil {
+		if event.Output.MessageOutput != nil && event.Output.MessageOutput.Message != nil {
+			msg := event.Output.MessageOutput.Message
+			sb.WriteString(fmt.Sprintf(", Output.Message: {Role: %q, Content: %q}", msg.Role, msg.Content))
+		}
+	}
+	if event.Action != nil {
+		if event.Action.Interrupted != nil {
+			sb.WriteString(fmt.Sprintf(", Action.Interrupted: {%d contexts}", len(event.Action.Interrupted.InterruptContexts)))
+		}
+		if event.Action.BreakLoop != nil {
+			sb.WriteString(fmt.Sprintf(", Action.BreakLoop: {From: %q, Done: %v}", event.Action.BreakLoop.From, event.Action.BreakLoop.Done))
+		}
+	}
+	if event.Err != nil {
+		sb.WriteString(fmt.Sprintf(", Err: %v", event.Err))
+	}
+	sb.WriteString("}")
+	return sb.String()
+}
+
+func TestPlanExecuteAgentInterruptResume(t *testing.T) {
+	ctx := context.Background()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockToolCallingModel := mockModel.NewMockToolCallingChatModel(ctrl)
+
+	approvalTool := &interruptibleTool{name: "approve_action", t: t}
+
+	plan := &defaultPlan{Steps: []string{"Execute action requiring approval", "Complete task"}}
+	userInput := []adk.Message{schema.UserMessage("Please execute the action")}
+
+	mockPlanner := mockAdk.NewMockAgent(ctrl)
+	mockPlanner.EXPECT().Name(gomock.Any()).Return("planner").AnyTimes()
+	mockPlanner.EXPECT().Description(gomock.Any()).Return("a planner agent").AnyTimes()
+
+	mockPlanner.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, input *adk.AgentInput, opts ...adk.AgentRunOption) *adk.AsyncIterator[*adk.AgentEvent] {
+			iterator, generator := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+
+			adk.AddSessionValue(ctx, PlanSessionKey, plan)
+			adk.AddSessionValue(ctx, UserInputSessionKey, userInput)
+
+			planJSON, _ := sonic.MarshalString(plan)
+			msg := schema.AssistantMessage(planJSON, nil)
+			event := adk.EventFromMessage(msg, nil, schema.Assistant, "")
+			generator.Send(event)
+			generator.Close()
+
+			return iterator
+		},
+	).Times(1)
+
+	toolCallMsg := schema.AssistantMessage("", []schema.ToolCall{
+		{
+			ID:   "call_1",
+			Type: "function",
+			Function: schema.FunctionCall{
+				Name:      "approve_action",
+				Arguments: `{"action": "execute"}`,
+			},
+		},
+	})
+
+	completionMsg := schema.AssistantMessage("Action approved and executed successfully", nil)
+
+	mockToolCallingModel.EXPECT().WithTools(gomock.Any()).Return(mockToolCallingModel, nil).AnyTimes()
+	mockToolCallingModel.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(toolCallMsg, nil).Times(1)
+	mockToolCallingModel.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(completionMsg, nil).AnyTimes()
+
+	executor, err := NewExecutor(ctx, &ExecutorConfig{
+		Model: mockToolCallingModel,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools: []tool.BaseTool{approvalTool},
+			},
+		},
+		MaxIterations: 5,
+	})
+	assert.NoError(t, err)
+
+	mockReplanner := mockAdk.NewMockAgent(ctrl)
+	mockReplanner.EXPECT().Name(gomock.Any()).Return("replanner").AnyTimes()
+	mockReplanner.EXPECT().Description(gomock.Any()).Return("a replanner agent").AnyTimes()
+
+	mockReplanner.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, input *adk.AgentInput, opts ...adk.AgentRunOption) *adk.AsyncIterator[*adk.AgentEvent] {
+			iterator, generator := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+
+			responseJSON := `{"response":"Task completed successfully"}`
+			msg := schema.AssistantMessage(responseJSON, nil)
+			event := adk.EventFromMessage(msg, nil, schema.Assistant, "")
+			generator.Send(event)
+
+			action := adk.NewBreakLoopAction("replanner")
+			generator.Send(&adk.AgentEvent{Action: action})
+
+			generator.Close()
+			return iterator
+		},
+	).AnyTimes()
+
+	agent, err := New(ctx, &Config{
+		Planner:       mockPlanner,
+		Executor:      executor,
+		Replanner:     mockReplanner,
+		MaxIterations: 5,
+	})
+	assert.NoError(t, err)
+
+	store := newCheckpointStore()
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{
+		Agent:           agent,
+		CheckPointStore: store,
+	})
+
+	iter := runner.Run(ctx, userInput, adk.WithCheckPointID("test-interrupt-1"))
+
+	var events []*adk.AgentEvent
+	var interruptEvent *adk.AgentEvent
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if event.Action != nil && event.Action.Interrupted != nil {
+			interruptEvent = event
+		}
+		events = append(events, event)
+	}
+
+	t.Logf("Total events received: %d", len(events))
+	for i, event := range events {
+		eventJSON, _ := sonic.MarshalString(event)
+		t.Logf("Event %d: %s", i, eventJSON)
+	}
+
+	if interruptEvent == nil {
+		t.Fatal("Expected an interrupt event from the tool, but none was received")
+	}
+
+	assert.NotNil(t, interruptEvent.Action.Interrupted, "Should have interrupt info")
+	assert.NotEmpty(t, interruptEvent.Action.Interrupted.InterruptContexts, "Should have interrupt contexts")
+
+	t.Logf("Interrupt event received with %d contexts", len(interruptEvent.Action.Interrupted.InterruptContexts))
+	for i, ctx := range interruptEvent.Action.Interrupted.InterruptContexts {
+		t.Logf("Interrupt context %d: ID=%s, Info=%v, Address=%v", i, ctx.ID, ctx.Info, ctx.Address)
+	}
+
+	var toolInterruptID string
+	for _, intCtx := range interruptEvent.Action.Interrupted.InterruptContexts {
+		if intCtx.IsRootCause {
+			toolInterruptID = intCtx.ID
+			break
+		}
+	}
+	assert.NotEmpty(t, toolInterruptID, "Should have a root cause interrupt ID")
+
+	t.Logf("Attempting to resume with interrupt ID: %s", toolInterruptID)
+
+	resumeIter, err := runner.ResumeWithParams(ctx, "test-interrupt-1", &adk.ResumeParams{
+		Targets: map[string]any{
+			toolInterruptID: "approved",
+		},
+	})
+	assert.NoError(t, err, "Resume should not error")
+	assert.NotNil(t, resumeIter, "Resume iterator should not be nil")
+
+	var resumeEvents []*adk.AgentEvent
+	for {
+		event, ok := resumeIter.Next()
+		if !ok {
+			break
+		}
+		resumeEvents = append(resumeEvents, event)
+	}
+
+	assert.NotEmpty(t, resumeEvents, "Should have resume events")
+
+	for _, event := range resumeEvents {
+		assert.NoError(t, event.Err, "Resume event should not have error")
+	}
+
+	var hasToolResponse, hasAssistantCompletion, hasBreakLoop bool
+	for _, event := range resumeEvents {
+		if event.Output != nil && event.Output.MessageOutput != nil {
+			msg := event.Output.MessageOutput.Message
+			if msg != nil {
+				if msg.Role == "tool" && strings.Contains(msg.Content, "Approved action executed") {
+					hasToolResponse = true
+				}
+				if msg.Role == "assistant" && strings.Contains(msg.Content, "approved") {
+					hasAssistantCompletion = true
+				}
+			}
+		}
+		if event.Action != nil && event.Action.BreakLoop != nil && event.Action.BreakLoop.Done {
+			hasBreakLoop = true
+		}
+	}
+
+	assert.True(t, hasToolResponse, "Should have tool response with approved action")
+	assert.True(t, hasAssistantCompletion, "Should have assistant completion message")
+	assert.True(t, hasBreakLoop, "Should have break loop action indicating completion")
 }

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/cloudwego/eino/internal/core"
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -40,6 +41,7 @@ type MessageVariant struct {
 	ToolName string
 }
 
+// EventFromMessage wraps a message or stream into an AgentEvent with role metadata.
 func EventFromMessage(msg Message, msgStream MessageStream,
 	role schema.RoleType, toolName string) *AgentEvent {
 	return &AgentEvent{
@@ -131,10 +133,12 @@ type AgentOutput struct {
 	CustomizedOutput any
 }
 
+// NewTransferToAgentAction creates an action to transfer to the specified agent.
 func NewTransferToAgentAction(destAgentName string) *AgentAction {
 	return &AgentAction{TransferToAgent: &TransferToAgentAction{DestAgentName: destAgentName}}
 }
 
+// NewExitAction creates an action that signals the agent to exit.
 func NewExitAction() *AgentAction {
 	return &AgentAction{Exit: true}
 }
@@ -149,10 +153,17 @@ type AgentAction struct {
 	BreakLoop *BreakLoopAction
 
 	CustomizedAction any
+
+	internalInterrupted *core.InterruptSignal
 }
 
+// RunStep CheckpointSchema: persisted via serialization.RunCtx (gob).
 type RunStep struct {
 	agentName string
+}
+
+func init() {
+	schema.RegisterName[[]RunStep]("eino_run_step_list")
 }
 
 func (r *RunStep) String() string {
@@ -187,9 +198,18 @@ type runStepSerialization struct {
 	AgentName string
 }
 
+// AgentEvent CheckpointSchema: persisted via serialization.RunCtx (gob).
 type AgentEvent struct {
 	AgentName string
 
+	// RunPath semantics:
+	// - The eino framework prepends parent context exactly once: parentRunPath + event.RunPath.
+	// - Custom agents should NOT include parent segments; any provided RunPath is treated as relative child provenance.
+	// - Exact RunPath match against the framework's runCtx.RunPath governs recording to runSession.
+	// STRONG RECOMMENDATION: Custom agents should NOT set RunPath themselves unless they fully understand
+	//   the merge and recording rules. Setting parent or absolute paths can lead to duplicated segments
+	//   after merge and unexpected non-recording. Prefer leaving RunPath empty and let the framework set
+	//   context, or append only relative child segments when implementing advanced orchestration.
 	RunPath []RunStep
 
 	Output *AgentOutput

@@ -26,8 +26,43 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
+// ErrExceedMaxIterations indicates the agent reached the maximum iterations limit.
 var ErrExceedMaxIterations = errors.New("exceeds max iterations")
 
+type adkToolResultSender func(ctx context.Context, toolName, callID, result string, prePopAction *AgentAction)
+type adkStreamToolResultSender func(ctx context.Context, toolName, callID string, resultStream *schema.StreamReader[string], prePopAction *AgentAction)
+
+type toolResultSenders struct {
+	addr         Address
+	sender       adkToolResultSender
+	streamSender adkStreamToolResultSender
+}
+
+type toolResultSendersCtxKey struct{}
+
+func setToolResultSendersToCtx(ctx context.Context, addr Address, sender adkToolResultSender, streamSender adkStreamToolResultSender) context.Context {
+	return context.WithValue(ctx, toolResultSendersCtxKey{}, &toolResultSenders{
+		addr:         addr,
+		sender:       sender,
+		streamSender: streamSender,
+	})
+}
+
+func getToolResultSendersFromCtx(ctx context.Context) *toolResultSenders {
+	v := ctx.Value(toolResultSendersCtxKey{})
+	if v == nil {
+		return nil
+	}
+	return v.(*toolResultSenders)
+}
+
+func isAddressAtDepth(currentAddr, handlerAddr Address, depth int) bool {
+	expectedLen := len(handlerAddr) + depth
+	return len(currentAddr) == expectedLen && currentAddr[:len(handlerAddr)].Equals(handlerAddr)
+}
+
+// State holds agent runtime state including messages, tool actions,
+// and remaining iterations.
 type State struct {
 	Messages []Message
 
@@ -38,29 +73,54 @@ type State struct {
 
 	AgentName string
 
-	AgentToolInterruptData map[string] /*tool call id*/ *agentToolInterruptInfo
-
 	RemainingIterations int
 }
 
-type agentToolInterruptInfo struct {
-	LastEvent *AgentEvent
-	Data      []byte
-}
-
+// SendToolGenAction attaches an AgentAction to the next tool event emitted for the
+// current tool execution.
+//
+// Where/when to use:
+//   - Invoke within a tool's Run (Invokable/Streamable) implementation to include
+//     an action alongside that tool's output event.
+//   - The action is scoped by the current tool call context: if a ToolCallID is
+//     available, it is used as the key to support concurrent calls of the same
+//     tool with different parameters; otherwise, the provided toolName is used.
+//   - The stored action is ephemeral and will be popped and attached to the tool
+//     event when the tool finishes (including streaming completion).
+//
+// Limitation:
+//   - This function is intended for use within ChatModelAgent runs only. It relies
+//     on ChatModelAgent's internal State to store and pop actions, which is not
+//     available in other agent types.
 func SendToolGenAction(ctx context.Context, toolName string, action *AgentAction) error {
+	key := toolName
+	toolCallID := compose.GetToolCallID(ctx)
+	if len(toolCallID) > 0 {
+		key = toolCallID
+	}
+
 	return compose.ProcessState(ctx, func(ctx context.Context, st *State) error {
-		st.ToolGenActions[toolName] = action
+		st.ToolGenActions[key] = action
 
 		return nil
 	})
 }
 
 func popToolGenAction(ctx context.Context, toolName string) *AgentAction {
+	toolCallID := compose.GetToolCallID(ctx)
+
 	var action *AgentAction
 	err := compose.ProcessState(ctx, func(ctx context.Context, st *State) error {
-		action = st.ToolGenActions[toolName]
-		if action != nil {
+		if len(toolCallID) > 0 {
+			if a := st.ToolGenActions[toolCallID]; a != nil {
+				action = a
+				delete(st.ToolGenActions, toolCallID)
+				return nil
+			}
+		}
+
+		if a := st.ToolGenActions[toolName]; a != nil {
+			action = a
 			delete(st.ToolGenActions, toolName)
 		}
 
@@ -72,6 +132,49 @@ func popToolGenAction(ctx context.Context, toolName string) *AgentAction {
 	}
 
 	return action
+}
+
+func newAdkToolResultCollectorMiddleware() compose.ToolMiddleware {
+	return compose.ToolMiddleware{
+		Invokable: func(next compose.InvokableToolEndpoint) compose.InvokableToolEndpoint {
+			return func(ctx context.Context, input *compose.ToolInput) (*compose.ToolOutput, error) {
+				senders := getToolResultSendersFromCtx(ctx)
+				var sender adkToolResultSender
+				if senders != nil {
+					sender = senders.sender
+				}
+				output, err := next(ctx, input)
+				if err != nil {
+					return nil, err
+				}
+				prePopAction := popToolGenAction(ctx, input.Name)
+				if sender != nil {
+					sender(ctx, input.Name, input.CallID, output.Result, prePopAction)
+				}
+				return output, nil
+			}
+		},
+		Streamable: func(next compose.StreamableToolEndpoint) compose.StreamableToolEndpoint {
+			return func(ctx context.Context, input *compose.ToolInput) (*compose.StreamToolOutput, error) {
+				senders := getToolResultSendersFromCtx(ctx)
+				var streamSender adkStreamToolResultSender
+				if senders != nil {
+					streamSender = senders.streamSender
+				}
+				output, err := next(ctx, input)
+				if err != nil {
+					return nil, err
+				}
+				prePopAction := popToolGenAction(ctx, input.Name)
+				if streamSender != nil {
+					streams := output.Result.Copy(2)
+					streamSender(ctx, input.Name, input.CallID, streams[0], prePopAction)
+					output.Result = streams[1]
+				}
+				return output, nil
+			}
+		},
+	}
 }
 
 type reactConfig struct {
@@ -86,6 +189,8 @@ type reactConfig struct {
 	maxIterations int
 
 	beforeChatModel, afterChatModel []func(context.Context, *ChatModelAgentState) error
+
+	modelRetryConfig *ModelRetryConfig
 }
 
 func genToolInfos(ctx context.Context, config *compose.ToolsNodeConfig) ([]*schema.ToolInfo, error) {
@@ -123,9 +228,8 @@ func getReturnDirectlyToolCallID(ctx context.Context) (string, bool) {
 func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
 	genState := func(ctx context.Context) *State {
 		return &State{
-			ToolGenActions:         map[string]*AgentAction{},
-			AgentName:              config.agentName,
-			AgentToolInterruptData: make(map[string]*agentToolInterruptInfo),
+			ToolGenActions: map[string]*AgentAction{},
+			AgentName:      config.agentName,
 			RemainingIterations: func() int {
 				if config.maxIterations <= 0 {
 					return 20
@@ -147,10 +251,20 @@ func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
 		return nil, err
 	}
 
-	chatModel, err := config.model.WithTools(toolsInfo)
+	baseModel := config.model
+	if config.modelRetryConfig != nil {
+		baseModel = newRetryChatModel(config.model, config.modelRetryConfig)
+	}
+
+	chatModel, err := baseModel.WithTools(toolsInfo)
 	if err != nil {
 		return nil, err
 	}
+
+	config.toolsConfig.ToolCallMiddlewares = append(
+		[]compose.ToolMiddleware{newAdkToolResultCollectorMiddleware()},
+		config.toolsConfig.ToolCallMiddlewares...,
+	)
 
 	toolsNode, err := compose.NewToolNode(ctx, config.toolsConfig)
 	if err != nil {

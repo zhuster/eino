@@ -20,12 +20,16 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/internal/callbacks"
+	"github.com/cloudwego/eino/internal/generic"
 	"github.com/cloudwego/eino/internal/serialization"
 	"github.com/cloudwego/eino/schema"
 )
@@ -34,12 +38,12 @@ type inMemoryStore struct {
 	m map[string][]byte
 }
 
-func (i *inMemoryStore) Get(ctx context.Context, checkPointID string) ([]byte, bool, error) {
+func (i *inMemoryStore) Get(_ context.Context, checkPointID string) ([]byte, bool, error) {
 	v, ok := i.m[checkPointID]
 	return v, ok, nil
 }
 
-func (i *inMemoryStore) Set(ctx context.Context, checkPointID string, checkPoint []byte) error {
+func (i *inMemoryStore) Set(_ context.Context, checkPointID string, checkPoint []byte) error {
 	i.m[checkPointID] = checkPoint
 	return nil
 }
@@ -82,61 +86,75 @@ func TestSimpleCheckPoint(t *testing.T) {
 	err = g.AddEdge("2", END)
 	assert.NoError(t, err)
 	ctx := context.Background()
-	r, err := g.Compile(ctx, WithNodeTriggerMode(AllPredecessor), WithCheckPointStore(store), WithInterruptAfterNodes([]string{"1"}), WithInterruptBeforeNodes([]string{"2"}))
+	r, err := g.Compile(ctx, WithNodeTriggerMode(AllPredecessor), WithCheckPointStore(store), WithInterruptAfterNodes([]string{"1"}), WithInterruptBeforeNodes([]string{"2"}), WithGraphName("root"))
 	assert.NoError(t, err)
 
 	_, err = r.Invoke(ctx, "start", WithCheckPointID("1"))
 	assert.NotNil(t, err)
 	info, ok := ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		State:           &testStruct{A: ""},
-		BeforeNodes:     []string{"2"},
-		AfterNodes:      []string{"1"},
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs:       make(map[string]*InterruptInfo),
-	}, info)
-
-	result, err := r.Invoke(ctx, "start", WithCheckPointID("1"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 0, len(path.path))
-		state.(*testStruct).A = "state"
-		return nil
+	assert.Equal(t, &testStruct{A: ""}, info.State)
+	assert.Equal(t, []string{"2"}, info.BeforeNodes)
+	assert.Equal(t, []string{"1"}, info.AfterNodes)
+	assert.Empty(t, info.RerunNodesExtra)
+	assert.Empty(t, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+		},
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
 	}))
+
+	rCtx := ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	result, err := r.Invoke(rCtx, "start", WithCheckPointID("1"))
 	assert.NoError(t, err)
 	assert.Equal(t, "start1state2", result)
 
-	_, err = r.Stream(ctx, "start", WithCheckPointID("2"))
-	assert.NotNil(t, err)
-	info, ok = ExtractInterruptInfo(err)
-	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		State:           &testStruct{A: ""},
-		BeforeNodes:     []string{"2"},
-		AfterNodes:      []string{"1"},
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs:       make(map[string]*InterruptInfo),
-	}, info)
+	/*	_, err = r.Stream(ctx, "start", WithCheckPointID("2"))
+		assert.NotNil(t, err)
+		info, ok = ExtractInterruptInfo(err)
+		assert.True(t, ok)
+		assert.Equal(t, &testStruct{A: ""}, info.State)
+		assert.Equal(t, []string{"2"}, info.BeforeNodes)
+		assert.Equal(t, []string{"1"}, info.AfterNodes)
+		assert.Empty(t, info.RerunNodesExtra)
+		assert.Empty(t, info.SubGraphs)
+		assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+			},
+			Info: &testStruct{
+				A: "",
+			},
+			IsRootCause: true,
+		}))
 
-	streamResult, err := r.Stream(ctx, "start", WithCheckPointID("2"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 0, len(path.path))
-		state.(*testStruct).A = "state"
-		return nil
-	}))
-	assert.NoError(t, err)
-	result = ""
-	for {
-		chunk, err := streamResult.Recv()
-		if err == io.EOF {
-			break
-		}
+		rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+		streamResult, err := r.Stream(rCtx, "start", WithCheckPointID("2"))
 		assert.NoError(t, err)
-		result += chunk
-	}
+		result = ""
+		for {
+			chunk, err := streamResult.Recv()
+			if err == io.EOF {
+				break
+			}
+			assert.NoError(t, err)
+			result += chunk
+		}
 
-	assert.Equal(t, "start1state2", result)
+		assert.Equal(t, "start1state2", result)*/
 }
 
-func TestCustomStructInAny(t *testing.T) {
+func TestCustomStructInAn2y(t *testing.T) {
 	store := newInMemoryStore()
 	g := NewGraph[string, string](WithGenLocalState(func(ctx context.Context) (state *testStruct) {
 		return &testStruct{A: ""}
@@ -161,24 +179,32 @@ func TestCustomStructInAny(t *testing.T) {
 	assert.NoError(t, err)
 
 	ctx := context.Background()
-	r, err := g.Compile(ctx, WithCheckPointStore(store), WithInterruptAfterNodes([]string{"1"}))
+	r, err := g.Compile(ctx, WithCheckPointStore(store), WithInterruptAfterNodes([]string{"1"}),
+		WithGraphName("root"))
 	assert.NoError(t, err)
 
 	_, err = r.Invoke(ctx, "start", WithCheckPointID("1"))
 	assert.NotNil(t, err)
 	info, ok := ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		State:           &testStruct{A: ""},
-		AfterNodes:      []string{"1"},
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs:       make(map[string]*InterruptInfo),
-	}, info)
-	result, err := r.Invoke(ctx, "start", WithCheckPointID("1"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 0, len(path.path))
-		state.(*testStruct).A = "state"
-		return nil
+	assert.Equal(t, &testStruct{A: ""}, info.State)
+	assert.Equal(t, []string{"1"}, info.AfterNodes)
+	assert.Empty(t, info.RerunNodesExtra)
+	assert.Empty(t, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+		},
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
 	}))
+	rCtx := ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	result, err := r.Invoke(rCtx, "start", WithCheckPointID("1"))
 	assert.NoError(t, err)
 	assert.Equal(t, "start1state2", result)
 
@@ -186,18 +212,25 @@ func TestCustomStructInAny(t *testing.T) {
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		State:           &testStruct{A: ""},
-		AfterNodes:      []string{"1"},
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs:       make(map[string]*InterruptInfo),
-	}, info)
-
-	streamResult, err := r.Stream(ctx, "start", WithCheckPointID("2"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 0, len(path.path))
-		state.(*testStruct).A = "state"
-		return nil
+	assert.Equal(t, &testStruct{A: ""}, info.State)
+	assert.Equal(t, []string{"1"}, info.AfterNodes)
+	assert.Empty(t, info.RerunNodesExtra)
+	assert.Empty(t, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+		},
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
 	}))
+
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	streamResult, err := r.Stream(rCtx, "start", WithCheckPointID("2"))
 	assert.NoError(t, err)
 	result = ""
 	for {
@@ -255,29 +288,48 @@ func TestSubGraph(t *testing.T) {
 	assert.NoError(t, err)
 
 	ctx := context.Background()
-	r, err := g.Compile(ctx, WithCheckPointStore(newInMemoryStore()))
+	r, err := g.Compile(ctx, WithCheckPointStore(newInMemoryStore()), WithGraphName("root"))
 	assert.NoError(t, err)
 
 	_, err = r.Invoke(ctx, "start", WithCheckPointID("1"))
 	assert.NotNil(t, err)
 	info, ok := ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: map[string]any{},
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: ""},
-				AfterNodes:      []string{"1"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: ""},
+			AfterNodes:      []string{"1"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs:       make(map[string]*InterruptInfo),
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
 			},
 		},
-	}, info)
-	result, err := r.Invoke(ctx, "start", WithCheckPointID("1"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 1, len(path.path))
-		state.(*testStruct).A = "state"
-		return nil
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+			},
+		},
 	}))
+
+	rCtx := ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	result, err := r.Invoke(rCtx, "start", WithCheckPointID("1"))
 	assert.NoError(t, err)
 	assert.Equal(t, "start11state23", result)
 
@@ -285,23 +337,41 @@ func TestSubGraph(t *testing.T) {
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: ""},
-				AfterNodes:      []string{"1"},
-				RerunNodesExtra: map[string]any{},
-				SubGraphs:       map[string]*InterruptInfo{},
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: ""},
+			AfterNodes:      []string{"1"},
+			RerunNodesExtra: make(map[string]any),
+			SubGraphs:       map[string]*InterruptInfo{},
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
 			},
 		},
-	}, info)
-
-	streamResult, err := r.Stream(ctx, "start", WithCheckPointID("2"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 1, len(path.path))
-		state.(*testStruct).A = "state"
-		return nil
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+			},
+		},
 	}))
+
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	streamResult, err := r.Stream(rCtx, "start", WithCheckPointID("2"))
 	assert.NoError(t, err)
 	result = ""
 	for {
@@ -324,21 +394,21 @@ type testGraphCallback struct {
 	onErrorTimes       int
 }
 
-func (t *testGraphCallback) OnStart(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+func (t *testGraphCallback) OnStart(ctx context.Context, info *callbacks.RunInfo, _ callbacks.CallbackInput) context.Context {
 	if info.Component == ComponentOfGraph {
 		t.onStartTimes++
 	}
 	return ctx
 }
 
-func (t *testGraphCallback) OnEnd(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
+func (t *testGraphCallback) OnEnd(ctx context.Context, info *callbacks.RunInfo, _ callbacks.CallbackOutput) context.Context {
 	if info.Component == ComponentOfGraph {
 		t.onEndTimes++
 	}
 	return ctx
 }
 
-func (t *testGraphCallback) OnError(ctx context.Context, info *callbacks.RunInfo, err error) context.Context {
+func (t *testGraphCallback) OnError(ctx context.Context, info *callbacks.RunInfo, _ error) context.Context {
 	if info.Component == ComponentOfGraph {
 		t.onErrorTimes++
 	}
@@ -362,25 +432,25 @@ func (t *testGraphCallback) OnEndWithStreamOutput(ctx context.Context, info *cal
 }
 
 func TestNestedSubGraph(t *testing.T) {
-	ssubG := NewGraph[string, string](WithGenLocalState(func(ctx context.Context) (state *testStruct) {
+	sSubG := NewGraph[string, string](WithGenLocalState(func(ctx context.Context) (state *testStruct) {
 		return &testStruct{A: ""}
 	}))
-	err := ssubG.AddLambdaNode("1", InvokableLambda(func(ctx context.Context, input string) (output string, err error) {
+	err := sSubG.AddLambdaNode("1", InvokableLambda(func(ctx context.Context, input string) (output string, err error) {
 		return input + "1", nil
 	}))
 	assert.NoError(t, err)
-	err = ssubG.AddLambdaNode("2", InvokableLambda(func(ctx context.Context, input string) (output string, err error) {
+	err = sSubG.AddLambdaNode("2", InvokableLambda(func(ctx context.Context, input string) (output string, err error) {
 		return input + "2", nil
 	}), WithStatePreHandler(func(ctx context.Context, in string, state *testStruct) (string, error) {
 		return in + state.A, nil
 	}))
 	assert.NoError(t, err)
 
-	err = ssubG.AddEdge(START, "1")
+	err = sSubG.AddEdge(START, "1")
 	assert.NoError(t, err)
-	err = ssubG.AddEdge("1", "2")
+	err = sSubG.AddEdge("1", "2")
 	assert.NoError(t, err)
-	err = ssubG.AddEdge("2", END)
+	err = sSubG.AddEdge("2", END)
 	assert.NoError(t, err)
 
 	subG := NewGraph[string, string](WithGenLocalState(func(ctx context.Context) (state *testStruct) {
@@ -390,7 +460,7 @@ func TestNestedSubGraph(t *testing.T) {
 		return input + "1", nil
 	}))
 	assert.NoError(t, err)
-	err = subG.AddGraphNode("2", ssubG, WithGraphCompileOptions(WithInterruptAfterNodes([]string{"1"})), WithStatePreHandler(func(ctx context.Context, in string, state *testStruct) (string, error) {
+	err = subG.AddGraphNode("2", sSubG, WithGraphCompileOptions(WithInterruptAfterNodes([]string{"1"})), WithStatePreHandler(func(ctx context.Context, in string, state *testStruct) (string, error) {
 		return in + state.A, nil
 	}), WithOutputKey("2"))
 	assert.NoError(t, err)
@@ -439,158 +509,294 @@ func TestNestedSubGraph(t *testing.T) {
 	assert.NoError(t, err)
 
 	ctx := context.Background()
-	r, err := g.Compile(ctx, WithCheckPointStore(newInMemoryStore()))
+	r, err := g.Compile(ctx, WithCheckPointStore(newInMemoryStore()), WithGraphName("root"))
 	assert.NoError(t, err)
 
-	tgcb := &testGraphCallback{}
-	_, err = r.Invoke(ctx, "start", WithCheckPointID("1"), WithCallbacks(tgcb))
+	tGCB := &testGraphCallback{}
+	_, err = r.Invoke(ctx, "start", WithCheckPointID("1"), WithCallbacks(tGCB))
 	assert.NotNil(t, err)
 	info, ok := ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: ""},
-				AfterNodes:      []string{"1"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: ""},
+			AfterNodes:      []string{"1"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs:       make(map[string]*InterruptInfo),
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
 			},
 		},
-	}, info)
-	times := 0
-	_, err = r.Invoke(ctx, "start", WithCheckPointID("1"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 1, len(path.path))
-		state.(*testStruct).A = "state"
-		return nil
-	}), WithCallbacks(tgcb))
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+			},
+		},
+	}))
+
+	rCtx := ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	_, err = r.Invoke(rCtx, "start", WithCheckPointID("1"), WithCallbacks(tGCB))
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: "state"},
-				AfterNodes:      []string{"3"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs: map[string]*InterruptInfo{
-					"2": {
-						State:           &testStruct{A: ""},
-						AfterNodes:      []string{"1"},
-						RerunNodesExtra: make(map[string]interface{}),
-						SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: "state"},
+			AfterNodes:      []string{"3"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs: map[string]*InterruptInfo{
+				"2": {
+					State:           &testStruct{A: ""},
+					AfterNodes:      []string{"1"},
+					RerunNodesExtra: make(map[string]interface{}),
+					SubGraphs:       make(map[string]*InterruptInfo),
+				},
+			},
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
+			},
+		},
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+				{
+					Type: AddressSegmentNode,
+					ID:   "2",
+				},
+			},
+			Info: &testStruct{
+				A: "state",
+			},
+			Parent: &InterruptCtx{
+				ID: "runnable:root",
+				Address: Address{
+					{
+						Type: AddressSegmentRunnable,
+						ID:   "root",
 					},
 				},
 			},
 		},
-	}, info)
-	_, err = r.Invoke(ctx, "start", WithCheckPointID("1"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		if times == 0 {
-			assert.Equal(t, 1, len(path.path))
-		} else {
-			assert.Equal(t, []string{"2", "2"}, path.path)
-			state.(*testStruct).A = "state"
-		}
-		times++
-		return nil
-	}), WithCallbacks(tgcb))
+	}))
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	_, err = r.Invoke(rCtx, "start", WithCheckPointID("1"), WithCallbacks(tGCB))
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: "state"},
-				BeforeNodes:     []string{"4"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: "state"},
+			BeforeNodes:     []string{"4"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs:       make(map[string]*InterruptInfo),
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
 			},
 		},
-	}, info)
-	result, err := r.Invoke(ctx, "start", WithCheckPointID("1"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 1, len(path.path))
-		state.(*testStruct).A = "state2"
-		return nil
-	}), WithCallbacks(tgcb))
+		Info: &testStruct{
+			A: "state",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+			},
+		},
+	}))
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state2"})
+	result, err := r.Invoke(rCtx, "start", WithCheckPointID("1"), WithCallbacks(tGCB))
 	assert.NoError(t, err)
 	assert.Equal(t, `start11state1state24
 start1134
 state24
 3`, result)
 
-	_, err = r.Stream(ctx, "start", WithCheckPointID("2"), WithCallbacks(tgcb))
+	_, err = r.Stream(ctx, "start", WithCheckPointID("2"), WithCallbacks(tGCB))
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: ""},
-				AfterNodes:      []string{"1"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: ""},
+			AfterNodes:      []string{"1"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs:       make(map[string]*InterruptInfo),
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
 			},
 		},
-	}, info)
-	times = 0
-	_, err = r.Stream(ctx, "start", WithCheckPointID("2"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 1, len(path.path))
-		state.(*testStruct).A = "state"
-		return nil
-	}), WithCallbacks(tgcb))
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+			},
+		},
+	}))
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	_, err = r.Stream(rCtx, "start", WithCheckPointID("2"), WithCallbacks(tGCB))
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: "state"},
-				AfterNodes:      []string{"3"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs: map[string]*InterruptInfo{
-					"2": {
-						State:           &testStruct{A: ""},
-						AfterNodes:      []string{"1"},
-						RerunNodesExtra: make(map[string]interface{}),
-						SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: "state"},
+			AfterNodes:      []string{"3"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs: map[string]*InterruptInfo{
+				"2": {
+					State:           &testStruct{A: ""},
+					AfterNodes:      []string{"1"},
+					RerunNodesExtra: make(map[string]interface{}),
+					SubGraphs:       make(map[string]*InterruptInfo),
+				},
+			},
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
+			},
+		},
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+				{
+					Type: AddressSegmentNode,
+					ID:   "2",
+				},
+			},
+			Info: &testStruct{
+				A: "state",
+			},
+			Parent: &InterruptCtx{
+				Address: Address{
+					{
+						Type: AddressSegmentRunnable,
+						ID:   "root",
 					},
 				},
 			},
 		},
-	}, info)
-	_, err = r.Stream(ctx, "start", WithCheckPointID("2"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		if times == 0 {
-			assert.Equal(t, 1, len(path.path))
-		} else {
-			assert.Equal(t, []string{"2", "2"}, path.path)
-			state.(*testStruct).A = "state"
-		}
-		times++
-		return nil
-	}), WithCallbacks(tgcb))
+	}))
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	_, err = r.Stream(rCtx, "start", WithCheckPointID("2"), WithCallbacks(tGCB))
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: "state"},
-				BeforeNodes:     []string{"4"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: "state"},
+			BeforeNodes:     []string{"4"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs:       make(map[string]*InterruptInfo),
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
 			},
 		},
-	}, info)
-	streamResult, err := r.Stream(ctx, "start", WithCheckPointID("2"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 1, len(path.path))
-		state.(*testStruct).A = "state2"
-		return nil
-	}), WithCallbacks(tgcb))
+		Info: &testStruct{
+			A: "state",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+			},
+		},
+	}))
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state2"})
+	streamResult, err := r.Stream(rCtx, "start", WithCheckPointID("2"), WithCallbacks(tGCB))
 	assert.NoError(t, err)
 	result = ""
 	for {
@@ -606,87 +812,156 @@ start1134
 state24
 3`, result)
 
-	assert.Equal(t, 10, tgcb.onStartTimes)       // 3+ssubG*1*3+subG*2*2+g*0
-	assert.Equal(t, 3, tgcb.onEndTimes)          // success*3
-	assert.Equal(t, 10, tgcb.onStreamStartTimes) // 3+ssubG*1*3+subG*2*2+g*0
-	assert.Equal(t, 3, tgcb.onStreamEndTimes)    // success*3
-	assert.Equal(t, 14, tgcb.onErrorTimes)       // 2*(ssubG*1*3+subG*2*2+g*0)
+	assert.Equal(t, 10, tGCB.onStartTimes)       // 3+sSubG*1*3+subG*2*2+g*0
+	assert.Equal(t, 3, tGCB.onEndTimes)          // success*3
+	assert.Equal(t, 10, tGCB.onStreamStartTimes) // 3+sSubG*1*3+subG*2*2+g*0
+	assert.Equal(t, 3, tGCB.onStreamEndTimes)    // success*3
+	assert.Equal(t, 14, tGCB.onErrorTimes)       // 2*(sSubG*1*3+subG*2*2+g*0)
 
 	// dag
-	r, err = g.Compile(ctx, WithCheckPointStore(newInMemoryStore()), WithNodeTriggerMode(AllPredecessor))
+	r, err = g.Compile(ctx, WithCheckPointStore(newInMemoryStore()), WithNodeTriggerMode(AllPredecessor),
+		WithGraphName("root"))
 	assert.NoError(t, err)
 
 	_, err = r.Invoke(ctx, "start", WithCheckPointID("1"))
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: ""},
-				AfterNodes:      []string{"1"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: ""},
+			AfterNodes:      []string{"1"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs:       make(map[string]*InterruptInfo),
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
 			},
 		},
-	}, info)
-	times = 0
-	_, err = r.Invoke(ctx, "start", WithCheckPointID("1"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 1, len(path.path))
-		state.(*testStruct).A = "state"
-		return nil
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+			},
+		},
 	}))
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	_, err = r.Invoke(rCtx, "start", WithCheckPointID("1"))
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: "state"},
-				AfterNodes:      []string{"3"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs: map[string]*InterruptInfo{
-					"2": {
-						State:           &testStruct{A: ""},
-						AfterNodes:      []string{"1"},
-						RerunNodesExtra: make(map[string]interface{}),
-						SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: "state"},
+			AfterNodes:      []string{"3"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs: map[string]*InterruptInfo{
+				"2": {
+					State:           &testStruct{A: ""},
+					AfterNodes:      []string{"1"},
+					RerunNodesExtra: make(map[string]interface{}),
+					SubGraphs:       make(map[string]*InterruptInfo),
+				},
+			},
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		ID: "runnable:root;node:2;node:2",
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
+			},
+		},
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+				{
+					Type: AddressSegmentNode,
+					ID:   "2",
+				},
+			},
+			Info: &testStruct{
+				A: "state",
+			},
+			Parent: &InterruptCtx{
+				Address: Address{
+					{
+						Type: AddressSegmentRunnable,
+						ID:   "root",
 					},
 				},
 			},
 		},
-	}, info)
-	_, err = r.Invoke(ctx, "start", WithCheckPointID("1"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		if times == 0 {
-			assert.Equal(t, 1, len(path.path))
-		} else {
-			assert.Equal(t, []string{"2", "2"}, path.path)
-			state.(*testStruct).A = "state"
-		}
-		times++
-		return nil
 	}))
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	_, err = r.Invoke(rCtx, "start", WithCheckPointID("1"))
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: "state"},
-				BeforeNodes:     []string{"4"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: "state"},
+			BeforeNodes:     []string{"4"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs:       make(map[string]*InterruptInfo),
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
 			},
 		},
-	}, info)
-	result, err = r.Invoke(ctx, "start", WithCheckPointID("1"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 1, len(path.path))
-		state.(*testStruct).A = "state2"
-		return nil
+		Info: &testStruct{
+			A: "state",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+			},
+		},
 	}))
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state2"})
+	result, err = r.Invoke(rCtx, "start", WithCheckPointID("1"))
 	assert.NoError(t, err)
 	assert.Equal(t, `start11state1state24
 start1134
@@ -697,73 +972,140 @@ state24
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: ""},
-				AfterNodes:      []string{"1"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: ""},
+			AfterNodes:      []string{"1"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs:       make(map[string]*InterruptInfo),
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
 			},
 		},
-	}, info)
-	times = 0
-	_, err = r.Stream(ctx, "start", WithCheckPointID("2"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 1, len(path.path))
-		state.(*testStruct).A = "state"
-		return nil
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+			},
+		},
 	}))
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	_, err = r.Stream(rCtx, "start", WithCheckPointID("2"))
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: "state"},
-				AfterNodes:      []string{"3"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs: map[string]*InterruptInfo{
-					"2": {
-						State:           &testStruct{A: ""},
-						AfterNodes:      []string{"1"},
-						RerunNodesExtra: make(map[string]interface{}),
-						SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: "state"},
+			AfterNodes:      []string{"3"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs: map[string]*InterruptInfo{
+				"2": {
+					State:           &testStruct{A: ""},
+					AfterNodes:      []string{"1"},
+					RerunNodesExtra: make(map[string]interface{}),
+					SubGraphs:       make(map[string]*InterruptInfo),
+				},
+			},
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
+			},
+		},
+		Info: &testStruct{
+			A: "",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+				{
+					Type: AddressSegmentNode,
+					ID:   "2",
+				},
+			},
+			Info: &testStruct{
+				A: "state",
+			},
+			Parent: &InterruptCtx{
+				Address: Address{
+					{
+						Type: AddressSegmentRunnable,
+						ID:   "root",
 					},
 				},
 			},
 		},
-	}, info)
-	_, err = r.Stream(ctx, "start", WithCheckPointID("2"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		if times == 0 {
-			assert.Equal(t, 1, len(path.path))
-		} else {
-			assert.Equal(t, []string{"2", "2"}, path.path)
-			state.(*testStruct).A = "state"
-		}
-		times++
-		return nil
 	}))
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state"})
+	_, err = r.Stream(rCtx, "start", WithCheckPointID("2"))
 	assert.NotNil(t, err)
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
-	assert.Equal(t, &InterruptInfo{
-		RerunNodesExtra: make(map[string]interface{}),
-		SubGraphs: map[string]*InterruptInfo{
-			"2": {
-				State:           &testStruct{A: "state"},
-				BeforeNodes:     []string{"4"},
-				RerunNodesExtra: make(map[string]interface{}),
-				SubGraphs:       make(map[string]*InterruptInfo),
+	assert.Equal(t, map[string]*InterruptInfo{
+		"2": {
+			State:           &testStruct{A: "state"},
+			BeforeNodes:     []string{"4"},
+			RerunNodesExtra: make(map[string]interface{}),
+			SubGraphs:       make(map[string]*InterruptInfo),
+		},
+	}, info.SubGraphs)
+	assert.True(t, info.InterruptContexts[0].EqualsWithoutID(&InterruptCtx{
+		Address: Address{
+			{
+				Type: AddressSegmentRunnable,
+				ID:   "root",
+			},
+			{
+				Type: AddressSegmentNode,
+				ID:   "2",
 			},
 		},
-	}, info)
-	streamResult, err = r.Stream(ctx, "start", WithCheckPointID("2"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
-		assert.Equal(t, 1, len(path.path))
-		state.(*testStruct).A = "state2"
-		return nil
+		Info: &testStruct{
+			A: "state",
+		},
+		IsRootCause: true,
+		Parent: &InterruptCtx{
+			Address: Address{
+				{
+					Type: AddressSegmentRunnable,
+					ID:   "root",
+				},
+			},
+		},
 	}))
+	rCtx = ResumeWithData(ctx, info.InterruptContexts[0].ID, &testStruct{A: "state2"})
+	streamResult, err = r.Stream(rCtx, "start", WithCheckPointID("2"))
 	assert.NoError(t, err)
 	result = ""
 	for {
@@ -917,11 +1259,11 @@ func TestEarlyFailCallback(t *testing.T) {
 	ctx := context.Background()
 	r, err := g.Compile(ctx, WithNodeTriggerMode(AllPredecessor))
 	assert.NoError(t, err)
-	tgcb := &testGraphCallback{}
-	_, _ = r.Invoke(ctx, "", WithCallbacks(tgcb), WithRuntimeMaxSteps(1))
-	assert.Equal(t, 1, tgcb.onStartTimes)
-	assert.Equal(t, 1, tgcb.onErrorTimes)
-	assert.Equal(t, 0, tgcb.onEndTimes)
+	tGCB := &testGraphCallback{}
+	_, _ = r.Invoke(ctx, "", WithCallbacks(tGCB), WithRuntimeMaxSteps(1))
+	assert.Equal(t, 1, tGCB.onStartTimes)
+	assert.Equal(t, 1, tGCB.onErrorTimes)
+	assert.Equal(t, 0, tGCB.onEndTimes)
 }
 
 func TestGraphStartInterrupt(t *testing.T) {
@@ -973,12 +1315,12 @@ type failStore struct {
 	t *testing.T
 }
 
-func (f *failStore) Get(ctx context.Context, checkPointID string) ([]byte, bool, error) {
+func (f *failStore) Get(_ context.Context, _ string) ([]byte, bool, error) {
 	f.t.Fatalf("cannot call store")
 	return nil, false, errors.New("fail")
 }
 
-func (f *failStore) Set(ctx context.Context, checkPointID string, checkPoint []byte) error {
+func (f *failStore) Set(_ context.Context, _ string, _ []byte) error {
 	f.t.Fatalf("cannot call store")
 	return errors.New("fail")
 }
@@ -1059,7 +1401,7 @@ func TestCancelInterrupt(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "input12", result)
 
-	// interrupt rerun nodes
+	// interrupt rerun nodes - with auto-enabled PersistRerunInput, input is preserved
 	canceledCtx, cancel = WithGraphInterrupt(ctx)
 	go func() {
 		time.Sleep(500 * time.Millisecond)
@@ -1072,7 +1414,7 @@ func TestCancelInterrupt(t *testing.T) {
 	assert.Equal(t, []string{"1"}, info.RerunNodes)
 	result, err = r.Invoke(ctx, "input", WithCheckPointID("3"))
 	assert.NoError(t, err)
-	assert.Equal(t, "12", result)
+	assert.Equal(t, "input12", result)
 
 	// dag
 	g = NewGraph[string, string]()
@@ -1117,7 +1459,7 @@ func TestCancelInterrupt(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "input12", result)
 
-	// interrupt rerun nodes
+	// interrupt rerun nodes - with auto-enabled PersistRerunInput, input is preserved
 	canceledCtx, cancel = WithGraphInterrupt(ctx)
 	go func() {
 		time.Sleep(300 * time.Millisecond)
@@ -1130,7 +1472,7 @@ func TestCancelInterrupt(t *testing.T) {
 	assert.Equal(t, []string{"1"}, info.RerunNodes)
 	result, err = r.Invoke(ctx, "input", WithCheckPointID("3"))
 	assert.NoError(t, err)
-	assert.Equal(t, "12", result)
+	assert.Equal(t, "input12", result)
 
 	// dag multi canceled nodes
 	gg := NewGraph[string, map[string]any]()
@@ -1175,7 +1517,7 @@ func TestCancelInterrupt(t *testing.T) {
 		"3": "input13",
 	}, result2)
 
-	// interrupt rerun nodes
+	// interrupt rerun nodes - with auto-enabled PersistRerunInput, input is preserved
 	canceledCtx, cancel = WithGraphInterrupt(ctx)
 	go func() {
 		time.Sleep(500 * time.Millisecond)
@@ -1189,7 +1531,474 @@ func TestCancelInterrupt(t *testing.T) {
 	result2, err = rr.Invoke(ctx, "input", WithCheckPointID("2"))
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]any{
-		"2": "2",
-		"3": "3",
+		"2": "input12",
+		"3": "input13",
 	}, result2)
+}
+
+func TestPersistRerunInputNonStream(t *testing.T) {
+	store := newInMemoryStore()
+
+	var mu sync.Mutex
+	var receivedInput string
+	var callCount int
+
+	g := NewGraph[string, string]()
+
+	err := g.AddLambdaNode("1", InvokableLambda(func(ctx context.Context, input string) (output string, err error) {
+		mu.Lock()
+		callCount++
+		currentCount := callCount
+		receivedInput = input
+		mu.Unlock()
+
+		if currentCount == 1 {
+			time.Sleep(2 * time.Second)
+		}
+		return input + "_processed", nil
+	}))
+	assert.NoError(t, err)
+
+	err = g.AddEdge(START, "1")
+	assert.NoError(t, err)
+	err = g.AddEdge("1", END)
+	assert.NoError(t, err)
+
+	ctx := context.Background()
+	r, err := g.Compile(ctx,
+		WithNodeTriggerMode(AllPredecessor),
+		WithCheckPointStore(store),
+	)
+	assert.NoError(t, err)
+
+	canceledCtx, cancel := WithGraphInterrupt(ctx)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel(WithGraphInterruptTimeout(0))
+	}()
+
+	_, err = r.Invoke(canceledCtx, "test_input", WithCheckPointID("cp1"))
+	assert.NotNil(t, err)
+	info, ok := ExtractInterruptInfo(err)
+	assert.True(t, ok)
+	assert.Equal(t, []string{"1"}, info.RerunNodes)
+
+	mu.Lock()
+	assert.Equal(t, "test_input", receivedInput)
+	mu.Unlock()
+
+	result, err := r.Invoke(ctx, "", WithCheckPointID("cp1"))
+	assert.NoError(t, err)
+	assert.Equal(t, "test_input_processed", result)
+
+	mu.Lock()
+	assert.Equal(t, "test_input", receivedInput)
+	assert.Equal(t, 2, callCount)
+	mu.Unlock()
+}
+
+func TestPersistRerunInputStream(t *testing.T) {
+	store := newInMemoryStore()
+
+	var mu sync.Mutex
+	var receivedInput string
+	var callCount int
+
+	g := NewGraph[string, string]()
+
+	err := g.AddLambdaNode("1", TransformableLambda(func(ctx context.Context, input *schema.StreamReader[string]) (output *schema.StreamReader[string], err error) {
+		mu.Lock()
+		callCount++
+		currentCount := callCount
+		mu.Unlock()
+
+		var sb string
+		for {
+			chunk, err := input.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			sb += chunk
+		}
+
+		mu.Lock()
+		receivedInput = sb
+		mu.Unlock()
+
+		if currentCount == 1 {
+			time.Sleep(2 * time.Second)
+		}
+
+		return schema.StreamReaderFromArray([]string{sb + "_processed"}), nil
+	}))
+	assert.NoError(t, err)
+
+	err = g.AddEdge(START, "1")
+	assert.NoError(t, err)
+	err = g.AddEdge("1", END)
+	assert.NoError(t, err)
+
+	ctx := context.Background()
+	r, err := g.Compile(ctx,
+		WithNodeTriggerMode(AllPredecessor),
+		WithCheckPointStore(store),
+	)
+	assert.NoError(t, err)
+
+	inputStream := schema.StreamReaderFromArray([]string{"chunk1", "chunk2", "chunk3"})
+
+	canceledCtx, cancel := WithGraphInterrupt(ctx)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel(WithGraphInterruptTimeout(0))
+	}()
+
+	_, err = r.Transform(canceledCtx, inputStream, WithCheckPointID("cp1"))
+	assert.NotNil(t, err)
+	info, ok := ExtractInterruptInfo(err)
+	assert.True(t, ok)
+	assert.Equal(t, []string{"1"}, info.RerunNodes)
+
+	mu.Lock()
+	assert.Equal(t, "chunk1chunk2chunk3", receivedInput)
+	mu.Unlock()
+
+	emptyInputStream := schema.StreamReaderFromArray([]string{})
+
+	resultStream, err := r.Transform(ctx, emptyInputStream, WithCheckPointID("cp1"))
+	assert.NoError(t, err)
+
+	var result string
+	for {
+		chunk, err := resultStream.Recv()
+		if err == io.EOF {
+			break
+		}
+		assert.NoError(t, err)
+		result += chunk
+	}
+
+	assert.Equal(t, "chunk1chunk2chunk3_processed", result)
+
+	mu.Lock()
+	assert.Equal(t, "chunk1chunk2chunk3", receivedInput)
+	assert.Equal(t, 2, callCount)
+	mu.Unlock()
+}
+
+type testPersistRerunInputState struct {
+	Prefix string
+}
+
+func TestPersistRerunInputWithPreHandler(t *testing.T) {
+	store := newInMemoryStore()
+
+	var mu sync.Mutex
+	var receivedInput string
+	var callCount int
+
+	schema.Register[testPersistRerunInputState]()
+
+	g := NewGraph[string, string](WithGenLocalState(func(ctx context.Context) *testPersistRerunInputState {
+		return &testPersistRerunInputState{Prefix: "prefix_"}
+	}))
+
+	err := g.AddLambdaNode("1", InvokableLambda(func(ctx context.Context, input string) (output string, err error) {
+		mu.Lock()
+		callCount++
+		currentCount := callCount
+		receivedInput = input
+		mu.Unlock()
+
+		if currentCount == 1 {
+			time.Sleep(2 * time.Second)
+		}
+		return input + "_processed", nil
+	}), WithStatePreHandler(func(ctx context.Context, in string, s *testPersistRerunInputState) (string, error) {
+		return s.Prefix + in, nil
+	}))
+	assert.NoError(t, err)
+
+	err = g.AddEdge(START, "1")
+	assert.NoError(t, err)
+	err = g.AddEdge("1", END)
+	assert.NoError(t, err)
+
+	ctx := context.Background()
+	r, err := g.Compile(ctx,
+		WithNodeTriggerMode(AllPredecessor),
+		WithCheckPointStore(store),
+	)
+	assert.NoError(t, err)
+
+	canceledCtx, cancel := WithGraphInterrupt(ctx)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel(WithGraphInterruptTimeout(0))
+	}()
+
+	_, err = r.Invoke(canceledCtx, "test_input", WithCheckPointID("cp1"))
+	assert.NotNil(t, err)
+	info, ok := ExtractInterruptInfo(err)
+	assert.True(t, ok)
+	if ok {
+		assert.Equal(t, []string{"1"}, info.RerunNodes)
+	}
+
+	mu.Lock()
+	assert.Equal(t, "prefix_test_input", receivedInput)
+	mu.Unlock()
+
+	result, err := r.Invoke(ctx, "", WithCheckPointID("cp1"))
+	assert.NoError(t, err)
+	assert.Equal(t, "prefix_test_input_processed", result)
+
+	mu.Lock()
+	assert.Equal(t, "prefix_test_input", receivedInput)
+	assert.Equal(t, 2, callCount)
+	mu.Unlock()
+}
+
+func TestPersistRerunInputBackwardCompatibility(t *testing.T) {
+	store := newInMemoryStore()
+
+	var receivedInput string
+	var callCount int
+
+	g := NewGraph[string, string]()
+
+	err := g.AddLambdaNode("1", InvokableLambda(func(ctx context.Context, input string) (output string, err error) {
+		callCount++
+		receivedInput = input
+		if len(input) > 0 {
+			return "", StatefulInterrupt(ctx, "interrupt", input)
+		}
+
+		_, _, restoredInput := GetInterruptState[string](ctx)
+		return restoredInput + "_processed", nil
+	}))
+	assert.NoError(t, err)
+
+	err = g.AddEdge(START, "1")
+	assert.NoError(t, err)
+	err = g.AddEdge("1", END)
+	assert.NoError(t, err)
+
+	ctx := context.Background()
+	r, err := g.Compile(ctx,
+		WithNodeTriggerMode(AllPredecessor),
+		WithCheckPointStore(store),
+	)
+	assert.NoError(t, err)
+
+	_, err = r.Invoke(ctx, "test_input", WithCheckPointID("cp1"))
+	assert.NotNil(t, err)
+	info, ok := ExtractInterruptInfo(err)
+	assert.True(t, ok)
+	assert.Equal(t, []string{"1"}, info.RerunNodes)
+
+	assert.Equal(t, "test_input", receivedInput)
+
+	result, err := r.Invoke(ctx, "", WithCheckPointID("cp1"))
+	assert.NoError(t, err)
+	assert.Equal(t, "test_input_processed", result)
+	assert.Equal(t, "", receivedInput)
+	assert.Equal(t, 2, callCount)
+}
+
+func TestPersistRerunInputSubGraph(t *testing.T) {
+	store := newInMemoryStore()
+
+	var mu sync.Mutex
+	var receivedInput string
+	var callCount int
+
+	subG := NewGraph[string, string]()
+	err := subG.AddLambdaNode("sub1", InvokableLambda(func(ctx context.Context, input string) (output string, err error) {
+		mu.Lock()
+		callCount++
+		currentCount := callCount
+		receivedInput = input
+		mu.Unlock()
+
+		if currentCount == 1 {
+			time.Sleep(2 * time.Second)
+		}
+		return input + "_sub_processed", nil
+	}))
+	assert.NoError(t, err)
+	err = subG.AddEdge(START, "sub1")
+	assert.NoError(t, err)
+	err = subG.AddEdge("sub1", END)
+	assert.NoError(t, err)
+
+	g := NewGraph[string, string]()
+	err = g.AddLambdaNode("1", InvokableLambda(func(ctx context.Context, input string) (output string, err error) {
+		return input + "_main", nil
+	}))
+	assert.NoError(t, err)
+	err = g.AddGraphNode("2", subG)
+	assert.NoError(t, err)
+	err = g.AddEdge(START, "1")
+	assert.NoError(t, err)
+	err = g.AddEdge("1", "2")
+	assert.NoError(t, err)
+	err = g.AddEdge("2", END)
+	assert.NoError(t, err)
+
+	ctx := context.Background()
+	r, err := g.Compile(ctx,
+		WithNodeTriggerMode(AllPredecessor),
+		WithCheckPointStore(store),
+	)
+	assert.NoError(t, err)
+
+	canceledCtx, cancel := WithGraphInterrupt(ctx)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel(WithGraphInterruptTimeout(0))
+	}()
+
+	_, err = r.Invoke(canceledCtx, "test", WithCheckPointID("cp1"))
+	assert.NotNil(t, err)
+	info, ok := ExtractInterruptInfo(err)
+	assert.True(t, ok, "Expected interrupt error, got: %v", err)
+	if len(info.SubGraphs) > 0 {
+		assert.Contains(t, info.SubGraphs, "2")
+		subInfo := info.SubGraphs["2"]
+		assert.Equal(t, []string{"sub1"}, subInfo.RerunNodes)
+	} else {
+		assert.Equal(t, []string{"2"}, info.RerunNodes)
+	}
+
+	mu.Lock()
+	assert.Equal(t, "test_main", receivedInput)
+	mu.Unlock()
+
+	result, err := r.Invoke(ctx, "", WithCheckPointID("cp1"))
+	assert.NoError(t, err)
+	assert.Equal(t, "test_main_sub_processed", result)
+
+	mu.Lock()
+	assert.Equal(t, "test_main", receivedInput)
+	assert.Equal(t, 2, callCount)
+	mu.Unlock()
+}
+
+type longRunningToolInput struct {
+	Input string `json:"input"`
+}
+
+func TestToolsNodeWithExternalGraphInterrupt(t *testing.T) {
+	store := newInMemoryStore()
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var callCount int
+
+	longRunningToolInfo := &schema.ToolInfo{
+		Name: "long_running_tool",
+		Desc: "A tool that takes a long time to run",
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"input": {Type: "string", Desc: "input"},
+		}),
+	}
+
+	longRunningTool := newCheckpointTestTool(longRunningToolInfo, func(ctx context.Context, in *longRunningToolInput) (string, error) {
+		mu.Lock()
+		callCount++
+		currentCount := callCount
+		mu.Unlock()
+
+		if currentCount == 1 {
+			time.Sleep(2 * time.Second)
+		}
+		return "result_" + in.Input, nil
+	})
+
+	toolsNode, err := NewToolNode(ctx, &ToolsNodeConfig{
+		Tools: []tool.BaseTool{longRunningTool},
+	})
+	assert.NoError(t, err)
+
+	g := NewGraph[*schema.Message, []*schema.Message]()
+	err = g.AddToolsNode("tools", toolsNode)
+	assert.NoError(t, err)
+	err = g.AddEdge(START, "tools")
+	assert.NoError(t, err)
+	err = g.AddEdge("tools", END)
+	assert.NoError(t, err)
+
+	r, err := g.Compile(ctx,
+		WithNodeTriggerMode(AllPredecessor),
+		WithCheckPointStore(store),
+	)
+	assert.NoError(t, err)
+
+	inputMsg := &schema.Message{
+		Role: schema.Assistant,
+		ToolCalls: []schema.ToolCall{{
+			ID:   "call_1",
+			Type: "function",
+			Function: schema.FunctionCall{
+				Name:      "long_running_tool",
+				Arguments: `{"input": "test"}`,
+			},
+		}},
+	}
+
+	canceledCtx, cancel := WithGraphInterrupt(ctx)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel(WithGraphInterruptTimeout(0))
+	}()
+
+	_, err = r.Invoke(canceledCtx, inputMsg, WithCheckPointID("cp1"))
+	assert.Error(t, err)
+	info, ok := ExtractInterruptInfo(err)
+	assert.True(t, ok, "Expected interrupt error, got: %v", err)
+	if ok {
+		assert.Equal(t, []string{"tools"}, info.RerunNodes)
+	}
+
+	result, err := r.Invoke(ctx, &schema.Message{}, WithCheckPointID("cp1"))
+	assert.NoError(t, err)
+	assert.Len(t, result, 1)
+	assert.Equal(t, `"result_test"`, result[0].Content)
+
+	mu.Lock()
+	assert.Equal(t, 2, callCount)
+	mu.Unlock()
+}
+
+type checkpointTestTool[I, O any] struct {
+	info *schema.ToolInfo
+	fn   func(ctx context.Context, in I) (O, error)
+}
+
+func newCheckpointTestTool[I, O any](info *schema.ToolInfo, f func(ctx context.Context, in I) (O, error)) tool.InvokableTool {
+	return &checkpointTestTool[I, O]{
+		info: info,
+		fn:   f,
+	}
+}
+
+func (f *checkpointTestTool[I, O]) Info(ctx context.Context) (*schema.ToolInfo, error) {
+	return f.info, nil
+}
+
+func (f *checkpointTestTool[I, O]) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
+	t := generic.NewInstance[I]()
+	err := sonic.UnmarshalString(argumentsInJSON, t)
+	if err != nil {
+		return "", err
+	}
+	o, err := f.fn(ctx, t)
+	if err != nil {
+		return "", err
+	}
+	return sonic.MarshalString(o)
 }

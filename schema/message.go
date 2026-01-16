@@ -41,6 +41,8 @@ func init() {
 	internal.RegisterStreamChunkConcatFunc(ConcatMessageArray)
 }
 
+// ConcatMessageArray merges aligned slices of messages into a single slice,
+// concatenating messages at the same index across the input arrays.
 func ConcatMessageArray(mas [][]*Message) ([]*Message, error) {
 	arrayLen := len(mas[0])
 
@@ -145,8 +147,9 @@ const (
 
 // MessagePartCommon represents the common abstract components for input and output of multi-modal types.
 type MessagePartCommon struct {
-	// URL can either be a traditional URL or a special URL conforming to RFC-2397 (https://www.rfc-editor.org/rfc/rfc2397).
-	// double check with model implementations for detailed instructions on how to use this.
+	// URL is primarily used for HTTP or HTTPS access links.
+	// For data in the format 'data:[<mediatype>][;base64],<data>' (the 'data' URL Schema of RFC-2397 (https://www.rfc-editor.org/rfc/rfc2397)),
+	// it is recommended to use Base64Data and MIMEType fields separately instead.
 	URL *string `json:"url,omitempty"`
 
 	// Base64Data represents the binary data in Base64 encoded string format.
@@ -184,6 +187,10 @@ type MessageInputVideo struct {
 // Choose either URL or Base64Data.
 type MessageInputFile struct {
 	MessagePartCommon
+
+	// Name represents the filename.
+	// Optional.
+	Name string `json:"name,omitempty"`
 }
 
 // MessageInputPart represents the input part of message.
@@ -203,6 +210,9 @@ type MessageInputPart struct {
 
 	// File is the file input of the part, it's used when Type is "file_url".
 	File *MessageInputFile `json:"file,omitempty"`
+
+	// Extra is used to store extra information.
+	Extra map[string]any `json:"extra,omitempty"`
 }
 
 // MessageOutputImage is used to represent an image part in message.
@@ -237,12 +247,17 @@ type MessageOutputPart struct {
 
 	// Video is the video output of the part, used when Type is ChatMessagePartTypeVideoURL.
 	Video *MessageOutputVideo `json:"video,omitempty"`
+
+	// Extra is used to store extra information.
+	Extra map[string]any `json:"extra,omitempty"`
 }
 
 // Deprecated: This struct is deprecated as the MultiContent field is deprecated.
-// ChatMessageImageURL is used to represent an image part in a chat message.
+// For the image input part of the model, use MessageInputImage.
+// For the image output part of the model, use MessageOutputImage.
 // Choose either URL or URI.
-// If your model implementation supports it, URL could be used to embed inline image data as defined in RFC-2397.
+// If your model implementation supports it, URL could embed inline image data
+// as defined in RFC-2397.
 type ChatMessageImageURL struct {
 	// URL can either be a traditional URL or a special URL conforming to RFC-2397 (https://www.rfc-editor.org/rfc/rfc2397).
 	// double check with model implementations for detailed instructions on how to use this.
@@ -275,9 +290,10 @@ const (
 )
 
 // Deprecated: This struct is deprecated as the MultiContent field is deprecated.
-// ChatMessageAudioURL is used to represent an audio part in a chat message.
+// For the audio input part of the model, use MessageInputAudio.
+// For the audio output part of the model, use MessageOutputAudio.
 // Choose either URL or URI.
-// If your model implementation supports it, URL could be used to embed inline audio data as defined in RFC-2397.
+// If supported, URL may embed inline audio data per RFC-2397.
 type ChatMessageAudioURL struct {
 	// URL can either be a traditional URL or a special URL conforming to RFC-2397 (https://www.rfc-editor.org/rfc/rfc2397).
 	// double check with model implementations for detailed instructions on how to use this.
@@ -291,9 +307,10 @@ type ChatMessageAudioURL struct {
 }
 
 // Deprecated: This struct is deprecated as the MultiContent field is deprecated.
-// ChatMessageVideoURL is used to represent an video part in a chat message.
+// For the video input part of the model, use MessageInputVideo.
+// For the video output part of the model, use MessageOutputVideo.
 // Choose either URL or URI.
-// If your model implementation supports it, URL could be used to embed inline video data as defined in RFC-2397.
+// If supported, URL may embed inline video data per RFC-2397.
 type ChatMessageVideoURL struct {
 	// URL can either be a traditional URL or a special URL conforming to RFC-2397 (https://www.rfc-editor.org/rfc/rfc2397).
 	// double check with model implementations for detailed instructions on how to use this.
@@ -307,7 +324,7 @@ type ChatMessageVideoURL struct {
 }
 
 // Deprecated: This struct is deprecated as the MultiContent field is deprecated.
-// ChatMessageFileURL is used to represent an file part in a chat message.
+// For the file input part of the model, use MessageInputFile.
 // Choose either URL or URI.
 type ChatMessageFileURL struct {
 	URL string `json:"url,omitempty"`
@@ -323,7 +340,7 @@ type ChatMessageFileURL struct {
 }
 
 // Deprecated: This struct is deprecated as the MultiContent field is deprecated.
-// ChatMessagePart is the part in a chat message.
+// For model input, use MessageInputPart. For model output, use MessageOutputPart.
 type ChatMessagePart struct {
 	// Type is the type of the part, eg. "text", "image_url", "audio_url", "video_url", "file_url".
 	Type ChatMessagePartType `json:"type,omitempty"`
@@ -365,6 +382,7 @@ type LogProb struct {
 	TopLogProbs []TopLogProb `json:"top_logprobs"`
 }
 
+// TopLogProb describes a likely token and its log probability at a position.
 type TopLogProb struct {
 	// Token represents the text of the token, which is a contiguous sequence of characters
 	// (e.g., a word, part of a word, or punctuation) as understood by the tokenization process used by the language model.
@@ -476,8 +494,18 @@ type TokenUsage struct {
 	CompletionTokens int `json:"completion_tokens"`
 	// TotalTokens is the total number of tokens.
 	TotalTokens int `json:"total_tokens"`
+	// CompletionTokensDetails is breakdown of completion tokens.
+	CompletionTokensDetails CompletionTokensDetails `json:"completion_token_details"`
 }
 
+type CompletionTokensDetails struct {
+	// ReasoningTokens tokens generated by the model for reasoning.
+	// This is currently supported by OpenAI, Gemini, ARK and Qwen  chat models.
+	// For other models, this field will be 0.
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+}
+
+// PromptTokenDetails provides a breakdown of prompt token usage.
 type PromptTokenDetails struct {
 	// Cached tokens present in the prompt.
 	CachedTokens int `json:"cached_tokens"`
@@ -1259,6 +1287,8 @@ func ConcatMessages(msgs []*Message) (*Message, error) {
 	return &ret, nil
 }
 
+// ConcatMessageStream drains a stream of messages and returns a single
+// concatenated message representing the merged content.
 func ConcatMessageStream(s *StreamReader[*Message]) (*Message, error) {
 	defer s.Close()
 
