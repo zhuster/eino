@@ -29,22 +29,21 @@ import (
 	"github.com/cloudwego/eino/internal/safe"
 )
 
-// ErrNoValue is used during StreamReaderWithConvert to skip a streamItem, excluding it from the converted stream.
-// e.g.
+// ErrNoValue is a sentinel returned from the convert function passed to
+// [StreamReaderWithConvert] to skip a stream element — the element is dropped
+// and the next one is read without surfacing an error to the caller.
 //
-// outStream = schema.StreamReaderWithConvert(s,
+// Use it to filter out empty or irrelevant chunks:
 //
-//	func(src string) (string, error) {
-//		if len(src) == 0 {
-//			return nil, schema.ErrNoValue
-//		}
+//	outStream = schema.StreamReaderWithConvert(s,
+//	    func(src string) (string, error) {
+//	        if len(src) == 0 {
+//	            return "", schema.ErrNoValue // skip empty chunks
+//	        }
+//	        return src, nil
+//	    })
 //
-//		return src.Message, nil
-//	})
-//
-// outStream will filter out the empty string.
-//
-// DO NOT use it under other circumstances.
+// DO NOT use ErrNoValue in any other context.
 var ErrNoValue = errors.New("no value")
 
 // ErrRecvAfterClosed indicates that StreamReader.Recv was unexpectedly called after StreamReader.Close.
@@ -87,9 +86,13 @@ func GetSourceName(err error) (string, bool) {
 //	}
 //
 //	defer sr.Close()
-//	for chunk, err := sr.Recv() {
+//	for {
+//		chunk, err := sr.Recv()
 //		if errors.Is(err, io.EOF) {
 //			break
+//		}
+//		if err != nil {
+//			panic(err)
 //		}
 //		fmt.Println(chunk)
 //	}
@@ -137,23 +140,31 @@ func (sw *StreamWriter[T]) Close() {
 	sw.stm.closeSend()
 }
 
-// StreamReader the receiver of a stream.
-// created by Pipe function.
-// eg.
+// StreamReader is the consumer side of an Eino stream.
 //
-//	sr, sw := schema.Pipe[string](3)
-//	// omit sending data
-//	// most of time, reader is returned by function, and used in another function.
+// A StreamReader is read-once: only one goroutine should call Recv, and the
+// reader must be closed exactly once (whether the loop finishes normally or
+// exits early via break or return).
 //
-//	for chunk, err := sr.Recv() {
-//		if errors.Is(err, io.EOF) {
-//			break
-//		}
-//		if err != nil {
-//			// handle error
-//		}
-//		fmt.Println(chunk)
+// Typical usage:
+//
+//	defer sr.Close() // always close, even after io.EOF
+//	for {
+//	    chunk, err := sr.Recv()
+//	    if errors.Is(err, io.EOF) {
+//	        break
+//	    }
+//	    if err != nil {
+//	        return err
+//	    }
+//	    process(chunk)
 //	}
+//
+// To fan-out a single stream to N independent consumers, call [StreamReader.Copy]
+// before any Recv; the original reader becomes unusable after the call.
+//
+// StreamReaders are created by [Pipe], [StreamReaderFromArray],
+// [MergeStreamReaders], [MergeNamedStreamReaders], and [StreamReaderWithConvert].
 type StreamReader[T any] struct {
 	typ readerType
 
@@ -171,11 +182,14 @@ type StreamReader[T any] struct {
 // Recv receives a value from the stream.
 // eg.
 //
-//	for chunk, err := sr.Recv() {
+//	for {
+//		chunk, err := sr.Recv()
 //		if errors.Is(err, io.EOF) {
 //			break
 //		}
 //		if err != nil {
+//			panic(err)
+//		}
 //		fmt.Println(chunk)
 //	}
 func (sr *StreamReader[T]) Recv() (T, error) {
@@ -202,9 +216,13 @@ func (sr *StreamReader[T]) Recv() (T, error) {
 //
 //	defer sr.Close()
 //
-//	for chunk, err := sr.Recv() {
+//	for {
+//		chunk, err := sr.Recv()
 //		if errors.Is(err, io.EOF) {
 //			break
+//		}
+//		if err != nil {
+//			panic(err)
 //		}
 //		fmt.Println(chunk)
 //	}
@@ -225,21 +243,21 @@ func (sr *StreamReader[T]) Close() {
 	}
 }
 
-// Copy creates a slice of new StreamReader.
-// The number of copies, indicated by the parameter n, should be a non-zero positive integer.
-// The original StreamReader will become unusable after Copy.
-// eg.
+// Copy creates n independent StreamReaders that each receive every element of
+// the original stream. The original StreamReader becomes unusable after Copy.
 //
-//	sr := schema.StreamReaderFromArray([]int{1, 2, 3})
-//	srs := sr.Copy(2)
+// Use Copy when two or more pipeline branches need the same stream —
+// for example, when a stream must be fed to both a callback handler and the
+// next node in a graph:
 //
-//	sr1 := srs[0]
-//	sr2 := srs[1]
+//	copies := sr.Copy(2)
+//	sr1, sr2 := copies[0], copies[1]
 //	defer sr1.Close()
 //	defer sr2.Close()
 //
-//	chunk1, err1 := sr1.Recv()
-//	chunk2, err2 := sr2.Recv()
+//	// sr1 and sr2 independently read the same elements
+//
+// n must be at least 1. If n < 2, the original reader is returned unchanged.
 func (sr *StreamReader[T]) Copy(n int) []*StreamReader[T] {
 	if n < 2 {
 		return []*StreamReader[T]{sr}
@@ -430,7 +448,14 @@ func (s *stream[T]) closeRecv() {
 //	sr := schema.StreamReaderFromArray([]int{1, 2, 3})
 //	defer sr.Close()
 //
-//	for chunk, err := sr.Recv() {
+//	for {
+//		chunk, err := sr.Recv()
+//		if errors.Is(err, io.EOF) {
+//			break
+//		}
+//		if err != nil {
+//			panic(err)
+//		}
 //		fmt.Println(chunk)
 //	}
 func StreamReaderFromArray[T any](arr []T) *StreamReader[T] {
@@ -574,6 +599,8 @@ type streamReaderWithConvert[T any] struct {
 	convert func(any) (T, error)
 
 	errWrapper func(error) error
+	onEOF      func() (T, error)
+	eofDone    bool
 }
 
 func newStreamReaderWithConvert[T any](origin iStreamReader, convert func(any) (T, error), opts ...ConvertOption) *StreamReader[T] {
@@ -588,6 +615,22 @@ func newStreamReaderWithConvert[T any](origin iStreamReader, convert func(any) (
 		errWrapper: opt.ErrWrapper,
 	}
 
+	if opt.OnEOF != nil {
+		typedOnEOF := opt.OnEOF
+		srw.onEOF = func() (T, error) {
+			v, err := typedOnEOF()
+			if err != nil {
+				var t T
+				return t, err
+			}
+			if v == nil {
+				var t T
+				return t, nil
+			}
+			return v.(T), nil
+		}
+	}
+
 	return &StreamReader[T]{
 		typ: readerTypeWithConvert,
 		srw: srw,
@@ -596,31 +639,55 @@ func newStreamReaderWithConvert[T any](origin iStreamReader, convert func(any) (
 
 type convertOptions struct {
 	ErrWrapper func(error) error
+	OnEOF      func() (any, error)
 }
 
 type ConvertOption func(*convertOptions)
 
-// WithErrWrapper wraps the first error encountered in a stream reader during conversion by StreamReaderWithConvert.
-// The error returned by the convert function will not be wrapped.
-// If the returned err is nil or is ErrNoValue, the stream chunk will be ignored
+// WithErrWrapper wraps non-EOF errors from the underlying stream reader during
+// conversion by StreamReaderWithConvert. Errors returned by the convert function
+// itself are not wrapped.
+// If the wrapper returns nil, the errored chunk is skipped and the next chunk
+// is read. If the wrapper returns a non-nil error, that error is surfaced to
+// the caller.
 func WithErrWrapper(wrapper func(error) error) ConvertOption {
 	return func(o *convertOptions) {
 		o.ErrWrapper = wrapper
 	}
 }
 
-// StreamReaderWithConvert converts the stream reader to another stream reader.
+// WithOnEOF registers a callback that fires once when the stream reaches EOF.
+// The callback can inject an error or a value before the final io.EOF is returned.
+// If the callback returns (nil, io.EOF), the stream ends normally.
+// If it returns a non-EOF error, that error is delivered first, then subsequent Recv returns io.EOF.
+// If it returns a non-nil value with nil error, that value is delivered first, then io.EOF.
+func WithOnEOF(fn func() (any, error)) ConvertOption {
+	return func(o *convertOptions) {
+		o.OnEOF = fn
+	}
+}
+
+// StreamReaderWithConvert returns a new StreamReader[D] that wraps sr and
+// applies convert to every element. The original reader sr must not be used
+// after calling this function.
 //
-// eg.
+// Filtering: if convert returns [ErrNoValue], the element is silently dropped
+// and the next element is read. This lets you strip empty or irrelevant chunks
+// without surfacing an error to the caller.
 //
-//	intReader := StreamReaderFromArray([]int{1, 2, 3})
-//	stringReader := StreamReaderWithConvert(sr, func(i int) (string, error) {
-//		return fmt.Sprintf("val_%d", i), nil
-//	})
+// Error wrapping: use [WithErrWrapper] to wrap non-convert errors (e.g. those
+// arriving from an upstream source) before they reach the caller.
 //
-//	defer stringReader.Close() // Close the reader if you using Recv(), or may cause memory/goroutine leak.
-//	s, err := stringReader.Recv()
-//	fmt.Println(s) // Output: val_1
+//	intReader := schema.StreamReaderFromArray([]int{0, 1, 2, 3})
+//	strReader := schema.StreamReaderWithConvert(intReader,
+//	    func(i int) (string, error) {
+//	        if i == 0 {
+//	            return "", schema.ErrNoValue // skip zero
+//	        }
+//	        return fmt.Sprintf("val_%d", i), nil
+//	    })
+//	defer strReader.Close()
+//	// Recv yields "val_1", "val_2", "val_3"
 func StreamReaderWithConvert[T, D any](sr *StreamReader[T], convert func(T) (D, error), opts ...ConvertOption) *StreamReader[D] {
 	c := func(a any) (D, error) {
 		return convert(a.(T))
@@ -636,13 +703,22 @@ func (srw *streamReaderWithConvert[T]) recv() (T, error) {
 		if err != nil {
 			var t T
 			if err == io.EOF {
-				return t, err
+				if srw.onEOF != nil && !srw.eofDone {
+					srw.eofDone = true
+					val, onEOFErr := srw.onEOF()
+					if onEOFErr != io.EOF {
+						return val, onEOFErr
+					}
+				}
+				return t, io.EOF
 			}
 			if srw.errWrapper != nil {
 				err = srw.errWrapper(err)
-				if err != nil && !errors.Is(err, ErrNoValue) {
+				if err != nil {
 					return t, err
 				}
+
+				continue
 			}
 
 			return t, err
@@ -821,20 +897,18 @@ func (csr *childStreamReader[T]) close() {
 	csr.parent.close(csr.index)
 }
 
-// MergeStreamReaders merge multiple StreamReader into one.
-// it's useful when you want to merge multiple streams into one.
-// e.g.
+// MergeStreamReaders fans in multiple StreamReaders into a single StreamReader.
+// Elements from all source streams are interleaved in arrival order (non-deterministic).
+// The merged reader reaches EOF only after every source stream has been exhausted.
 //
-//	sr1, sr2 := schema.Pipe[string](2)
-//	defer sr1.Close()
-//	defer sr2.Close()
+// Callers must still close the merged reader; it propagates the close signal
+// to all underlying sources.
 //
-//	sr := schema.MergeStreamReaders([]*schema.StreamReader[string]{sr1, sr2})
+// Use [MergeNamedStreamReaders] instead when you need to know which source
+// stream ended first (it emits a [SourceEOF] per-source EOF rather than
+// silently discarding them).
 //
-//	defer sr.Close()
-//	for chunk, err := sr.Recv() {
-//		fmt.Println(chunk)
-//	}
+// Returns nil if srs is empty.
 func MergeStreamReaders[T any](srs []*StreamReader[T]) *StreamReader[T] {
 	if len(srs) < 1 {
 		return nil
@@ -885,37 +959,34 @@ func MergeStreamReaders[T any](srs []*StreamReader[T]) *StreamReader[T] {
 	}
 }
 
-// MergeNamedStreamReaders merges multiple StreamReaders into one, preserving their names.
-// When a source stream reaches EOF, the merged stream will return a SourceEOF error
-// containing the name of the source stream that ended.
-// This is useful when you need to track which source stream has completed.
-// e.g.
+// MergeNamedStreamReaders merges multiple named StreamReaders into one.
+// Unlike [MergeStreamReaders], when a source stream reaches EOF the merged
+// reader emits a [SourceEOF] error (instead of silently continuing) so you can
+// detect exactly which source finished. Use [GetSourceName] to retrieve the
+// name from a SourceEOF error. The merged reader itself signals io.EOF only
+// after all named sources are exhausted.
 //
-//	sr1, sw1 := schema.Pipe[string](2)
-//	sr2, sw2 := schema.Pipe[string](2)
+// This is useful when downstream logic must react differently to each source
+// completing — for example, draining one agent's output before proceeding:
 //
-//	namedStreams := map[string]*StreamReader[string]{
-//		"stream1": sr1,
-//		"stream2": sr2,
+//	namedStreams := map[string]*schema.StreamReader[string]{
+//	    "agent_a": srA,
+//	    "agent_b": srB,
 //	}
-//
-//	mergedSR := schema.MergeNamedStreamReaders(namedStreams)
-//	defer mergedSR.Close()
-//
+//	merged := schema.MergeNamedStreamReaders(namedStreams)
+//	defer merged.Close()
 //	for {
-//		chunk, err := mergedSR.Recv()
-//		if err != nil {
-//			if sourceName, ok := schema.GetSourceName(err); ok {
-//				fmt.Printf("Stream %s ended\n", sourceName)
-//				continue
-//			}
-//			if errors.Is(err, io.EOF) {
-//				break // All streams have ended
-//			}
-//			// Handle other errors
-//		}
-//		fmt.Println(chunk)
+//	    chunk, err := merged.Recv()
+//	    if errors.Is(err, io.EOF) { break }
+//	    if name, ok := schema.GetSourceName(err); ok {
+//	        fmt.Printf("%s finished\n", name)
+//	        continue
+//	    }
+//	    if err != nil { return err }
+//	    process(chunk)
 //	}
+//
+// Returns nil if srs is empty.
 func MergeNamedStreamReaders[T any](srs map[string]*StreamReader[T]) *StreamReader[T] {
 	if len(srs) < 1 {
 		return nil

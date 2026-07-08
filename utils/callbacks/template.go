@@ -20,6 +20,7 @@ package callbacks
 import (
 	"context"
 
+	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/callbacks"
 	"github.com/cloudwego/eino/components"
 	"github.com/cloudwego/eino/components/document"
@@ -54,16 +55,21 @@ func NewHandlerHelper() *HandlerHelper {
 //
 // then use the handler with runnable.Invoke(ctx, input, compose.WithCallbacks(handler))
 type HandlerHelper struct {
-	promptHandler      *PromptCallbackHandler
-	chatModelHandler   *ModelCallbackHandler
-	embeddingHandler   *EmbeddingCallbackHandler
-	indexerHandler     *IndexerCallbackHandler
-	retrieverHandler   *RetrieverCallbackHandler
-	loaderHandler      *LoaderCallbackHandler
-	transformerHandler *TransformerCallbackHandler
-	toolHandler        *ToolCallbackHandler
-	toolsNodeHandler   *ToolsNodeCallbackHandlers
-	composeTemplates   map[components.Component]callbacks.Handler
+	promptHandler           *PromptCallbackHandler
+	chatModelHandler        *ModelCallbackHandler
+	embeddingHandler        *EmbeddingCallbackHandler
+	indexerHandler          *IndexerCallbackHandler
+	retrieverHandler        *RetrieverCallbackHandler
+	loaderHandler           *LoaderCallbackHandler
+	transformerHandler      *TransformerCallbackHandler
+	toolHandler             *ToolCallbackHandler
+	toolsNodeHandler        *ToolsNodeCallbackHandlers
+	agentHandler            *AgentCallbackHandler
+	agenticAgentHandler     *AgenticAgentCallbackHandler
+	agenticPromptHandler    *AgenticPromptCallbackHandler
+	agenticModelHandler     *AgenticModelCallbackHandler
+	agenticToolsNodeHandler *AgenticToolsNodeCallbackHandlers
+	composeTemplates        map[components.Component]callbacks.Handler
 }
 
 // Handler returns the callbacks.Handler created by HandlerHelper.
@@ -125,6 +131,36 @@ func (c *HandlerHelper) ToolsNode(handler *ToolsNodeCallbackHandlers) *HandlerHe
 	return c
 }
 
+// AgenticPrompt sets the agentic prompt handler for the handler helper, which will be called when the agentic prompt component is executed.
+func (c *HandlerHelper) AgenticPrompt(handler *AgenticPromptCallbackHandler) *HandlerHelper {
+	c.agenticPromptHandler = handler
+	return c
+}
+
+// AgenticModel sets the agentic chat model handler for the handler helper, which will be called when the agentic chat model component is executed.
+func (c *HandlerHelper) AgenticModel(handler *AgenticModelCallbackHandler) *HandlerHelper {
+	c.agenticModelHandler = handler
+	return c
+}
+
+// AgenticToolsNode sets the agentic tools node handler for the handler helper, which will be called when the agentic tools node is executed.
+func (c *HandlerHelper) AgenticToolsNode(handler *AgenticToolsNodeCallbackHandlers) *HandlerHelper {
+	c.agenticToolsNodeHandler = handler
+	return c
+}
+
+// Agent sets the agent handler for the handler helper, which will be called when the agent is executed.
+func (c *HandlerHelper) Agent(handler *AgentCallbackHandler) *HandlerHelper {
+	c.agentHandler = handler
+	return c
+}
+
+// AgenticAgent sets the agentic agent callback handler for the handler helper, which will be called when an agentic agent is executed.
+func (c *HandlerHelper) AgenticAgent(handler *AgenticAgentCallbackHandler) *HandlerHelper {
+	c.agenticAgentHandler = handler
+	return c
+}
+
 // Graph sets the graph handler for the handler helper, which will be called when the graph is executed.
 func (c *HandlerHelper) Graph(handler callbacks.Handler) *HandlerHelper {
 	c.composeTemplates[compose.ComponentOfGraph] = handler
@@ -153,8 +189,12 @@ func (c *handlerTemplate) OnStart(ctx context.Context, info *callbacks.RunInfo, 
 	switch info.Component {
 	case components.ComponentOfPrompt:
 		return c.promptHandler.OnStart(ctx, info, prompt.ConvCallbackInput(input))
+	case components.ComponentOfAgenticPrompt:
+		return c.agenticPromptHandler.OnStart(ctx, info, prompt.ConvCallbackInput(input))
 	case components.ComponentOfChatModel:
 		return c.chatModelHandler.OnStart(ctx, info, model.ConvCallbackInput(input))
+	case components.ComponentOfAgenticModel:
+		return c.agenticModelHandler.OnStart(ctx, info, model.ConvAgenticCallbackInput(input))
 	case components.ComponentOfEmbedding:
 		return c.embeddingHandler.OnStart(ctx, info, embedding.ConvCallbackInput(input))
 	case components.ComponentOfIndexer:
@@ -169,6 +209,12 @@ func (c *handlerTemplate) OnStart(ctx context.Context, info *callbacks.RunInfo, 
 		return c.toolHandler.OnStart(ctx, info, tool.ConvCallbackInput(input))
 	case compose.ComponentOfToolsNode:
 		return c.toolsNodeHandler.OnStart(ctx, info, convToolsNodeCallbackInput(input))
+	case compose.ComponentOfAgenticToolsNode:
+		return c.agenticToolsNodeHandler.OnStart(ctx, info, convAgenticToolsNodeCallbackInput(input))
+	case adk.ComponentOfAgent:
+		return c.agentHandler.OnStart(ctx, info, adk.ConvAgentCallbackInput(input))
+	case adk.ComponentOfAgenticAgent:
+		return c.agenticAgentHandler.OnStart(ctx, info, adk.ConvTypedCallbackInput[*schema.AgenticMessage](input))
 	case compose.ComponentOfGraph,
 		compose.ComponentOfChain,
 		compose.ComponentOfLambda:
@@ -184,8 +230,12 @@ func (c *handlerTemplate) OnEnd(ctx context.Context, info *callbacks.RunInfo, ou
 	switch info.Component {
 	case components.ComponentOfPrompt:
 		return c.promptHandler.OnEnd(ctx, info, prompt.ConvCallbackOutput(output))
+	case components.ComponentOfAgenticPrompt:
+		return c.agenticPromptHandler.OnEnd(ctx, info, prompt.ConvCallbackOutput(output))
 	case components.ComponentOfChatModel:
 		return c.chatModelHandler.OnEnd(ctx, info, model.ConvCallbackOutput(output))
+	case components.ComponentOfAgenticModel:
+		return c.agenticModelHandler.OnEnd(ctx, info, model.ConvAgenticCallbackOutput(output))
 	case components.ComponentOfEmbedding:
 		return c.embeddingHandler.OnEnd(ctx, info, embedding.ConvCallbackOutput(output))
 	case components.ComponentOfIndexer:
@@ -200,6 +250,12 @@ func (c *handlerTemplate) OnEnd(ctx context.Context, info *callbacks.RunInfo, ou
 		return c.toolHandler.OnEnd(ctx, info, tool.ConvCallbackOutput(output))
 	case compose.ComponentOfToolsNode:
 		return c.toolsNodeHandler.OnEnd(ctx, info, convToolsNodeCallbackOutput(output))
+	case compose.ComponentOfAgenticToolsNode:
+		return c.agenticToolsNodeHandler.OnEnd(ctx, info, convAgenticToolsNodeCallbackOutput(output))
+	case adk.ComponentOfAgent:
+		return c.agentHandler.OnEnd(ctx, info, adk.ConvAgentCallbackOutput(output))
+	case adk.ComponentOfAgenticAgent:
+		return c.agenticAgentHandler.OnEnd(ctx, info, adk.ConvTypedCallbackOutput[*schema.AgenticMessage](output))
 	case compose.ComponentOfGraph,
 		compose.ComponentOfChain,
 		compose.ComponentOfLambda:
@@ -215,8 +271,12 @@ func (c *handlerTemplate) OnError(ctx context.Context, info *callbacks.RunInfo, 
 	switch info.Component {
 	case components.ComponentOfPrompt:
 		return c.promptHandler.OnError(ctx, info, err)
+	case components.ComponentOfAgenticPrompt:
+		return c.agenticPromptHandler.OnError(ctx, info, err)
 	case components.ComponentOfChatModel:
 		return c.chatModelHandler.OnError(ctx, info, err)
+	case components.ComponentOfAgenticModel:
+		return c.agenticModelHandler.OnError(ctx, info, err)
 	case components.ComponentOfEmbedding:
 		return c.embeddingHandler.OnError(ctx, info, err)
 	case components.ComponentOfIndexer:
@@ -231,6 +291,8 @@ func (c *handlerTemplate) OnError(ctx context.Context, info *callbacks.RunInfo, 
 		return c.toolHandler.OnError(ctx, info, err)
 	case compose.ComponentOfToolsNode:
 		return c.toolsNodeHandler.OnError(ctx, info, err)
+	case compose.ComponentOfAgenticToolsNode:
+		return c.agenticToolsNodeHandler.OnError(ctx, info, err)
 	case compose.ComponentOfGraph,
 		compose.ComponentOfChain,
 		compose.ComponentOfLambda:
@@ -263,6 +325,11 @@ func (c *handlerTemplate) OnEndWithStreamOutput(ctx context.Context, info *callb
 			schema.StreamReaderWithConvert(output, func(item callbacks.CallbackOutput) (*model.CallbackOutput, error) {
 				return model.ConvCallbackOutput(item), nil
 			}))
+	case components.ComponentOfAgenticModel:
+		return c.agenticModelHandler.OnEndWithStreamOutput(ctx, info,
+			schema.StreamReaderWithConvert(output, func(item callbacks.CallbackOutput) (*model.AgenticCallbackOutput, error) {
+				return model.ConvAgenticCallbackOutput(item), nil
+			}))
 	case components.ComponentOfTool:
 		return c.toolHandler.OnEndWithStreamOutput(ctx, info,
 			schema.StreamReaderWithConvert(output, func(item callbacks.CallbackOutput) (*tool.CallbackOutput, error) {
@@ -272,6 +339,11 @@ func (c *handlerTemplate) OnEndWithStreamOutput(ctx context.Context, info *callb
 		return c.toolsNodeHandler.OnEndWithStreamOutput(ctx, info,
 			schema.StreamReaderWithConvert(output, func(item callbacks.CallbackOutput) ([]*schema.Message, error) {
 				return convToolsNodeCallbackOutput(item), nil
+			}))
+	case compose.ComponentOfAgenticToolsNode:
+		return c.agenticToolsNodeHandler.OnEndWithStreamOutput(ctx, info,
+			schema.StreamReaderWithConvert(output, func(item callbacks.CallbackOutput) ([]*schema.AgenticMessage, error) {
+				return convAgenticToolsNodeCallbackOutput(item), nil
 			}))
 	case compose.ComponentOfGraph,
 		compose.ComponentOfChain,
@@ -283,6 +355,8 @@ func (c *handlerTemplate) OnEndWithStreamOutput(ctx context.Context, info *callb
 }
 
 // Needed checks if the callback handler is needed for the given timing.
+//
+//nolint:cyclop
 func (c *handlerTemplate) Needed(ctx context.Context, info *callbacks.RunInfo, timing callbacks.CallbackTiming) bool {
 	if info == nil {
 		return false
@@ -291,6 +365,10 @@ func (c *handlerTemplate) Needed(ctx context.Context, info *callbacks.RunInfo, t
 	switch info.Component {
 	case components.ComponentOfChatModel:
 		if c.chatModelHandler != nil && c.chatModelHandler.Needed(ctx, info, timing) {
+			return true
+		}
+	case components.ComponentOfAgenticModel:
+		if c.agenticModelHandler != nil && c.agenticModelHandler.Needed(ctx, info, timing) {
 			return true
 		}
 	case components.ComponentOfEmbedding:
@@ -309,6 +387,10 @@ func (c *handlerTemplate) Needed(ctx context.Context, info *callbacks.RunInfo, t
 		if c.promptHandler != nil && c.promptHandler.Needed(ctx, info, timing) {
 			return true
 		}
+	case components.ComponentOfAgenticPrompt:
+		if c.agenticPromptHandler != nil && c.agenticPromptHandler.Needed(ctx, info, timing) {
+			return true
+		}
 	case components.ComponentOfRetriever:
 		if c.retrieverHandler != nil && c.retrieverHandler.Needed(ctx, info, timing) {
 			return true
@@ -323,6 +405,18 @@ func (c *handlerTemplate) Needed(ctx context.Context, info *callbacks.RunInfo, t
 		}
 	case compose.ComponentOfToolsNode:
 		if c.toolsNodeHandler != nil && c.toolsNodeHandler.Needed(ctx, info, timing) {
+			return true
+		}
+	case compose.ComponentOfAgenticToolsNode:
+		if c.agenticToolsNodeHandler != nil && c.agenticToolsNodeHandler.Needed(ctx, info, timing) {
+			return true
+		}
+	case adk.ComponentOfAgent:
+		if c.agentHandler != nil && c.agentHandler.Needed(ctx, info, timing) {
+			return true
+		}
+	case adk.ComponentOfAgenticAgent:
+		if c.agenticAgentHandler != nil && c.agenticAgentHandler.Needed(ctx, info, timing) {
 			return true
 		}
 	case compose.ComponentOfGraph,
@@ -559,6 +653,139 @@ func convToolsNodeCallbackInput(src callbacks.CallbackInput) *schema.Message {
 func convToolsNodeCallbackOutput(src callbacks.CallbackInput) []*schema.Message {
 	switch t := src.(type) {
 	case []*schema.Message:
+		return t
+	default:
+		return nil
+	}
+}
+
+// AgentCallbackHandler handles callbacks for agents using *schema.Message.
+// Use ComponentOfAgent to filter callback events to agent-related events.
+type AgentCallbackHandler struct {
+	// OnStart is called when an agent run begins. Return a modified context to propagate values.
+	OnStart func(ctx context.Context, info *callbacks.RunInfo, input *adk.AgentCallbackInput) context.Context
+	// OnEnd is called when an agent run completes. The output's Events iterator should be
+	// consumed asynchronously to avoid blocking.
+	OnEnd func(ctx context.Context, info *callbacks.RunInfo, output *adk.AgentCallbackOutput) context.Context
+}
+
+func (ch *AgentCallbackHandler) Needed(ctx context.Context, info *callbacks.RunInfo, timing callbacks.CallbackTiming) bool {
+	switch timing {
+	case callbacks.TimingOnStart:
+		return ch.OnStart != nil
+	case callbacks.TimingOnEnd:
+		return ch.OnEnd != nil
+	default:
+		return false
+	}
+}
+
+// AgenticAgentCallbackHandler handles callbacks for agentic agents using *schema.AgenticMessage.
+// Use ComponentOfAgenticAgent to filter callback events to agentic-agent-related events.
+type AgenticAgentCallbackHandler struct {
+	// OnStart is called when an agentic agent run begins. Return a modified context to propagate values.
+	OnStart func(ctx context.Context, info *callbacks.RunInfo, input *adk.TypedAgentCallbackInput[*schema.AgenticMessage]) context.Context
+	// OnEnd is called when an agentic agent run completes. The output's Events iterator should be
+	// consumed asynchronously to avoid blocking.
+	OnEnd func(ctx context.Context, info *callbacks.RunInfo, output *adk.TypedAgentCallbackOutput[*schema.AgenticMessage]) context.Context
+}
+
+func (ch *AgenticAgentCallbackHandler) Needed(ctx context.Context, info *callbacks.RunInfo, timing callbacks.CallbackTiming) bool {
+	switch timing {
+	case callbacks.TimingOnStart:
+		return ch.OnStart != nil
+	case callbacks.TimingOnEnd:
+		return ch.OnEnd != nil
+	default:
+		return false
+	}
+}
+
+// AgenticPromptCallbackHandler is the handler for the agentic prompt callback.
+type AgenticPromptCallbackHandler struct {
+	// OnStart is the callback function for the start of the agentic prompt.
+	OnStart func(ctx context.Context, runInfo *callbacks.RunInfo, input *prompt.CallbackInput) context.Context
+	// OnEnd is the callback function for the end of the agentic prompt.
+	OnEnd func(ctx context.Context, runInfo *callbacks.RunInfo, output *prompt.CallbackOutput) context.Context
+	// OnError is the callback function for the error of the agentic prompt.
+	OnError func(ctx context.Context, runInfo *callbacks.RunInfo, err error) context.Context
+}
+
+// Needed checks if the callback handler is needed for the given timing.
+func (ch *AgenticPromptCallbackHandler) Needed(ctx context.Context, runInfo *callbacks.RunInfo, timing callbacks.CallbackTiming) bool {
+	switch timing {
+	case callbacks.TimingOnStart:
+		return ch.OnStart != nil
+	case callbacks.TimingOnEnd:
+		return ch.OnEnd != nil
+	case callbacks.TimingOnError:
+		return ch.OnError != nil
+	default:
+		return false
+	}
+}
+
+// AgenticModelCallbackHandler is the handler for the agentic chat model callback.
+type AgenticModelCallbackHandler struct {
+	OnStart               func(ctx context.Context, runInfo *callbacks.RunInfo, input *model.AgenticCallbackInput) context.Context
+	OnEnd                 func(ctx context.Context, runInfo *callbacks.RunInfo, output *model.AgenticCallbackOutput) context.Context
+	OnEndWithStreamOutput func(ctx context.Context, runInfo *callbacks.RunInfo, output *schema.StreamReader[*model.AgenticCallbackOutput]) context.Context
+	OnError               func(ctx context.Context, runInfo *callbacks.RunInfo, err error) context.Context
+}
+
+// Needed checks if the callback handler is needed for the given timing.
+func (ch *AgenticModelCallbackHandler) Needed(ctx context.Context, runInfo *callbacks.RunInfo, timing callbacks.CallbackTiming) bool {
+	switch timing {
+	case callbacks.TimingOnStart:
+		return ch.OnStart != nil
+	case callbacks.TimingOnEnd:
+		return ch.OnEnd != nil
+	case callbacks.TimingOnError:
+		return ch.OnError != nil
+	case callbacks.TimingOnEndWithStreamOutput:
+		return ch.OnEndWithStreamOutput != nil
+	default:
+		return false
+	}
+}
+
+// AgenticToolsNodeCallbackHandlers defines optional callbacks for the Agentic Tools node
+// lifecycle events.
+type AgenticToolsNodeCallbackHandlers struct {
+	OnStart               func(ctx context.Context, info *callbacks.RunInfo, input *schema.AgenticMessage) context.Context
+	OnEnd                 func(ctx context.Context, info *callbacks.RunInfo, input []*schema.AgenticMessage) context.Context
+	OnEndWithStreamOutput func(ctx context.Context, info *callbacks.RunInfo, output *schema.StreamReader[[]*schema.AgenticMessage]) context.Context
+	OnError               func(ctx context.Context, info *callbacks.RunInfo, err error) context.Context
+}
+
+// Needed reports whether a handler is registered for the given timing.
+func (ch *AgenticToolsNodeCallbackHandlers) Needed(ctx context.Context, runInfo *callbacks.RunInfo, timing callbacks.CallbackTiming) bool {
+	switch timing {
+	case callbacks.TimingOnStart:
+		return ch.OnStart != nil
+	case callbacks.TimingOnEnd:
+		return ch.OnEnd != nil
+	case callbacks.TimingOnEndWithStreamOutput:
+		return ch.OnEndWithStreamOutput != nil
+	case callbacks.TimingOnError:
+		return ch.OnError != nil
+	default:
+		return false
+	}
+}
+
+func convAgenticToolsNodeCallbackInput(src callbacks.CallbackInput) *schema.AgenticMessage {
+	switch t := src.(type) {
+	case *schema.AgenticMessage:
+		return t
+	default:
+		return nil
+	}
+}
+
+func convAgenticToolsNodeCallbackOutput(src callbacks.CallbackInput) []*schema.AgenticMessage {
+	switch t := src.(type) {
+	case []*schema.AgenticMessage:
 		return t
 	default:
 		return nil

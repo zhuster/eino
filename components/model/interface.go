@@ -22,19 +22,61 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
-// BaseChatModel defines the basic interface for chat models.
-// It provides methods for generating complete outputs and streaming outputs.
-// This interface serves as the foundation for all chat model implementations.
-//
-//go:generate  mockgen -destination ../../internal/mock/components/model/ChatModel_mock.go --package model -source interface.go
-type BaseChatModel interface {
-	Generate(ctx context.Context, input []*schema.Message, opts ...Option) (*schema.Message, error)
-	Stream(ctx context.Context, input []*schema.Message, opts ...Option) (
-		*schema.StreamReader[*schema.Message], error)
+// messageType is the sealed type constraint for message types used in BaseModel.
+// Only *schema.Message and *schema.AgenticMessage satisfy this constraint.
+type messageType interface {
+	*schema.Message | *schema.AgenticMessage
 }
 
-// Deprecated: Please use ToolCallingChatModel interface instead, which provides a safer way to bind tools
-// without the concurrency issues and tool overwriting problems that may arise from the BindTools method.
+// BaseModel is the generic base model interface parameterized by message type M.
+// It exposes two modes of interaction:
+//   - [BaseModel.Generate]: blocks until the model returns a complete response.
+//   - [BaseModel.Stream]: returns a [schema.StreamReader] that yields message
+//     chunks incrementally as the model generates them.
+type BaseModel[M messageType] interface {
+	Generate(ctx context.Context, input []M, opts ...Option) (M, error)
+	Stream(ctx context.Context, input []M, opts ...Option) (*schema.StreamReader[M], error)
+}
+
+// BaseChatModel is a backward-compatible type alias for BaseModel specialized
+// with *schema.Message. All existing code using model.BaseChatModel continues
+// to work without modification.
+//
+// It exposes two modes of interaction:
+//   - [BaseChatModel.Generate]: blocks until the model returns a complete response.
+//   - [BaseChatModel.Stream]: returns a [schema.StreamReader] that yields message
+//     chunks incrementally as the model generates them.
+//
+// The input is a slice of [schema.Message] representing the conversation history.
+// Messages carry a role (system, user, assistant, tool) and support multimodal
+// content (text, images, audio, video). Tool messages must include a ToolCallID
+// that correlates them with a prior assistant tool-call message.
+//
+// Stream usage — the caller is responsible for closing the reader:
+//
+//	reader, err := m.Stream(ctx, messages)
+//	if err != nil { ... }
+//	defer reader.Close()
+//	for {
+//	    chunk, err := reader.Recv()
+//	    if errors.Is(err, io.EOF) { break }
+//	    if err != nil { ... }
+//	    // handle chunk
+//	}
+//
+// Note: a [schema.StreamReader] can only be read once. If multiple consumers
+// need the stream, it must be copied before reading.
+//
+//go:generate  mockgen -destination ../../internal/mock/components/model/ChatModel_mock.go --package model github.com/cloudwego/eino/components/model BaseChatModel,ChatModel,ToolCallingChatModel
+type BaseChatModel = BaseModel[*schema.Message]
+
+// Deprecated: Use [ToolCallingChatModel] instead.
+//
+// ChatModel extends [BaseChatModel] with tool binding via [ChatModel.BindTools].
+// BindTools mutates the instance in place, which causes a race condition when
+// the same instance is used concurrently: one goroutine's tool list can
+// overwrite another's. Prefer [ToolCallingChatModel.WithTools], which returns
+// a new immutable instance and is safe for concurrent use.
 type ChatModel interface {
 	BaseChatModel
 
@@ -44,13 +86,24 @@ type ChatModel interface {
 	BindTools(tools []*schema.ToolInfo) error
 }
 
-// ToolCallingChatModel extends BaseChatModel with tool calling capabilities.
-// It provides a WithTools method that returns a new instance with
-// the specified tools bound, avoiding state mutation and concurrency issues.
+// ToolCallingChatModel extends [BaseChatModel] with safe tool binding.
+//
+// Unlike the deprecated [ChatModel.BindTools], [ToolCallingChatModel.WithTools]
+// does not mutate the receiver — it returns a new instance with the given tools
+// attached. This makes it safe to share a base model instance across goroutines
+// and derive per-request variants with different tool sets:
+//
+//	base, _ := openai.NewChatModel(ctx, cfg)           // shared, no tools
+//	withSearch, _ := base.WithTools([]*schema.ToolInfo{searchTool})
+//	withCalc, _  := base.WithTools([]*schema.ToolInfo{calcTool})
 type ToolCallingChatModel interface {
 	BaseChatModel
 
-	// WithTools returns a new ToolCallingChatModel instance with the specified tools bound.
-	// This method does not modify the current instance, making it safer for concurrent use.
 	WithTools(tools []*schema.ToolInfo) (ToolCallingChatModel, error)
 }
+
+// AgenticModel is a type alias for BaseModel specialized with
+// *schema.AgenticMessage. Unlike ToolCallingChatModel, agentic models do NOT
+// expose a WithTools method; tools are passed at request time via the
+// model.WithTools option, consistent with how ChatModelAgent binds tools.
+type AgenticModel = BaseModel[*schema.AgenticMessage]

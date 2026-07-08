@@ -20,12 +20,15 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 
 	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/callbacks"
+	"github.com/cloudwego/eino/components"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	mockAdk "github.com/cloudwego/eino/internal/mock/adk"
@@ -47,6 +50,7 @@ func TestNewSupervisor(t *testing.T) {
 	subAgent2 := mockAdk.NewMockAgent(ctrl)
 
 	supervisorAgent.EXPECT().Name(gomock.Any()).Return("SupervisorAgent").AnyTimes()
+	supervisorAgent.EXPECT().Description(gomock.Any()).Return("Supervisor agent description").AnyTimes()
 	subAgent1.EXPECT().Name(gomock.Any()).Return("SubAgent1").AnyTimes()
 	subAgent2.EXPECT().Name(gomock.Any()).Return("SubAgent2").AnyTimes()
 
@@ -210,18 +214,18 @@ func (m *approvableTool) Info(_ context.Context) (*schema.ToolInfo, error) {
 }
 
 func (m *approvableTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
-	wasInterrupted, _, storedArguments := compose.GetInterruptState[string](ctx)
+	wasInterrupted, _, storedArguments := tool.GetInterruptState[string](ctx)
 	if !wasInterrupted {
-		return "", compose.StatefulInterrupt(ctx, &approvalInfo{
+		return "", tool.StatefulInterrupt(ctx, &approvalInfo{
 			ToolName:        m.name,
 			ArgumentsInJSON: argumentsInJSON,
 			ToolCallID:      compose.GetToolCallID(ctx),
 		}, argumentsInJSON)
 	}
 
-	isResumeTarget, hasData, data := compose.GetResumeContext[*approvalResult](ctx)
+	isResumeTarget, hasData, data := tool.GetResumeContext[*approvalResult](ctx)
 	if !isResumeTarget {
-		return "", compose.StatefulInterrupt(ctx, &approvalInfo{
+		return "", tool.StatefulInterrupt(ctx, &approvalInfo{
 			ToolName:        m.name,
 			ArgumentsInJSON: storedArguments,
 			ToolCallID:      compose.GetToolCallID(ctx),
@@ -489,4 +493,667 @@ func TestNestedSupervisorInterruptResume(t *testing.T) {
 
 	assert.True(t, hasToolResponse, "Should have tool response indicating successful payment processing")
 	assert.True(t, hasTransferBack, "Should have transfer back to outer supervisor indicating completion")
+}
+
+func TestSupervisorExit(t *testing.T) {
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	supervisorAgent := mockAdk.NewMockAgent(ctrl)
+	subAgent := mockAdk.NewMockAgent(ctrl)
+
+	supervisorAgent.EXPECT().Name(gomock.Any()).Return("Supervisor").AnyTimes()
+	supervisorAgent.EXPECT().Description(gomock.Any()).Return("Supervisor description").AnyTimes()
+	subAgent.EXPECT().Name(gomock.Any()).Return("SubAgent").AnyTimes()
+
+	// 1. Supervisor transfers to SubAgent
+	aMsg, tMsg := adk.GenTransferMessages(ctx, "SubAgent")
+	i1, g1 := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+	g1.Send(adk.EventFromMessage(aMsg, nil, schema.Assistant, ""))
+	event1 := adk.EventFromMessage(tMsg, nil, schema.Tool, tMsg.ToolName)
+	event1.Action = &adk.AgentAction{TransferToAgent: &adk.TransferToAgentAction{DestAgentName: "SubAgent"}}
+	g1.Send(event1)
+	g1.Close()
+	supervisorAgent.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any()).Return(i1).Times(1)
+
+	// 2. SubAgent emits Exit action
+	i2, g2 := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+	exitEvent := &adk.AgentEvent{
+		AgentName: "SubAgent",
+		Action:    &adk.AgentAction{Exit: true},
+		Output: &adk.AgentOutput{
+			MessageOutput: &adk.MessageVariant{
+				Role:    schema.Assistant,
+				Message: schema.AssistantMessage("Exiting...", nil),
+			},
+		},
+	}
+	g2.Send(exitEvent)
+	g2.Close()
+	subAgent.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any()).Return(i2).Times(1)
+
+	conf := &Config{
+		Supervisor: supervisorAgent,
+		SubAgents:  []adk.Agent{subAgent},
+	}
+
+	multiAgent, err := New(ctx, conf)
+	assert.NoError(t, err)
+
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: multiAgent})
+	aIter := runner.Run(ctx, []adk.Message{schema.UserMessage("test")})
+
+	// Collect events
+	var events []*adk.AgentEvent
+	for {
+		event, ok := aIter.Next()
+		if !ok {
+			break
+		}
+		events = append(events, event)
+	}
+
+	foundExit := false
+	foundTransferBack := false
+
+	for _, e := range events {
+		if e.Action != nil {
+			if e.Action.Exit {
+				foundExit = true
+			}
+			if e.Action.TransferToAgent != nil && e.Action.TransferToAgent.DestAgentName == "Supervisor" {
+				foundTransferBack = true
+			}
+		}
+	}
+
+	assert.True(t, foundExit, "Should have found Exit action")
+	assert.False(t, foundTransferBack, "Should NOT have found Transfer back to Supervisor after Exit")
+}
+
+func TestNestedSupervisorExit(t *testing.T) {
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	topSupervisor := mockAdk.NewMockAgent(ctrl)
+	midSupervisor := mockAdk.NewMockAgent(ctrl)
+	worker := mockAdk.NewMockAgent(ctrl)
+
+	topSupervisor.EXPECT().Name(gomock.Any()).Return("TopSupervisor").AnyTimes()
+	topSupervisor.EXPECT().Description(gomock.Any()).Return("Top supervisor description").AnyTimes()
+	midSupervisor.EXPECT().Name(gomock.Any()).Return("MidSupervisor").AnyTimes()
+	midSupervisor.EXPECT().Description(gomock.Any()).Return("Mid supervisor description").AnyTimes()
+	worker.EXPECT().Name(gomock.Any()).Return("Worker").AnyTimes()
+
+	// 1. TopSupervisor transfers to MidSupervisor
+	aMsg1, tMsg1 := adk.GenTransferMessages(ctx, "MidSupervisor")
+	i1, g1 := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+	g1.Send(adk.EventFromMessage(aMsg1, nil, schema.Assistant, ""))
+	event1 := adk.EventFromMessage(tMsg1, nil, schema.Tool, tMsg1.ToolName)
+	event1.Action = &adk.AgentAction{TransferToAgent: &adk.TransferToAgentAction{DestAgentName: "MidSupervisor"}}
+	g1.Send(event1)
+	g1.Close()
+	topSupervisor.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any()).Return(i1).AnyTimes()
+
+	// 2. MidSupervisor transfers to Worker
+	aMsg2, tMsg2 := adk.GenTransferMessages(ctx, "Worker")
+	i2, g2 := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+	g2.Send(adk.EventFromMessage(aMsg2, nil, schema.Assistant, ""))
+	event2 := adk.EventFromMessage(tMsg2, nil, schema.Tool, tMsg2.ToolName)
+	event2.Action = &adk.AgentAction{TransferToAgent: &adk.TransferToAgentAction{DestAgentName: "Worker"}}
+	g2.Send(event2)
+	g2.Close()
+	midSupervisor.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any()).Return(i2).AnyTimes()
+
+	// 3. Worker emits Exit action
+	i3, g3 := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+	exitEvent := &adk.AgentEvent{
+		AgentName: "Worker",
+		Action:    &adk.AgentAction{Exit: true},
+		Output: &adk.AgentOutput{
+			MessageOutput: &adk.MessageVariant{
+				Role:    schema.Assistant,
+				Message: schema.AssistantMessage("Worker Exiting...", nil),
+			},
+		},
+	}
+	g3.Send(exitEvent)
+	g3.Close()
+	worker.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any()).Return(i3).Times(1)
+
+	// Build Nested System
+	// Mid System: MidSupervisor -> [Worker]
+	midSystem, err := New(ctx, &Config{
+		Supervisor: midSupervisor,
+		SubAgents:  []adk.Agent{worker},
+	})
+	assert.NoError(t, err)
+	// We need to give the midSystem the name "MidSupervisor" so TopSupervisor can find it
+	// supervisor.New returns a ResumableAgent that delegates Name() to the supervisor agent.
+	// So midSystem.Name() should already be "MidSupervisor" because midSupervisor.Name() is "MidSupervisor".
+
+	// Top System: TopSupervisor -> [midSystem]
+	topSystem, err := New(ctx, &Config{
+		Supervisor: topSupervisor,
+		SubAgents:  []adk.Agent{midSystem},
+	})
+	assert.NoError(t, err)
+
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: topSystem})
+	aIter := runner.Run(ctx, []adk.Message{schema.UserMessage("test nested exit")})
+
+	// Collect events
+	var events []*adk.AgentEvent
+	for {
+		event, ok := aIter.Next()
+		if !ok {
+			break
+		}
+		events = append(events, event)
+	}
+
+	foundExit := false
+	foundTransferBackToMidAfterExit := false
+	foundTransferBackToTopAfterExit := false
+
+	for _, e := range events {
+		if e.Action != nil {
+			if e.Action.Exit {
+				foundExit = true
+			}
+			if foundExit && e.Action.TransferToAgent != nil {
+				if e.Action.TransferToAgent.DestAgentName == "MidSupervisor" {
+					foundTransferBackToMidAfterExit = true
+				}
+				if e.Action.TransferToAgent.DestAgentName == "TopSupervisor" {
+					foundTransferBackToTopAfterExit = true
+				}
+			}
+		}
+	}
+
+	assert.True(t, foundExit, "Should have found Exit action")
+	assert.False(t, foundTransferBackToMidAfterExit, "Should NOT have found Transfer back to MidSupervisor after Exit")
+	assert.False(t, foundTransferBackToTopAfterExit, "Should NOT have found Transfer back to TopSupervisor after Exit")
+}
+
+func TestChatModelAgentInternalEventsExit(t *testing.T) {
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	supervisorAgent := mockAdk.NewMockAgent(ctrl)
+	workerModel := mockModel.NewMockToolCallingChatModel(ctrl)
+	innerAgent := mockAdk.NewMockAgent(ctrl)
+
+	supervisorAgent.EXPECT().Name(gomock.Any()).Return("Supervisor").AnyTimes()
+	supervisorAgent.EXPECT().Description(gomock.Any()).Return("Supervisor description").AnyTimes()
+	innerAgent.EXPECT().Name(gomock.Any()).Return("InnerAgent").AnyTimes()
+	innerAgent.EXPECT().Description(gomock.Any()).Return("Inner Agent Description").AnyTimes()
+
+	// 1. Supervisor transfers to Worker (only once, then exits when worker transfers back)
+	supervisorRunCount := 0
+	supervisorAgent.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, input *adk.AgentInput, opts ...adk.AgentRunOption) *adk.AsyncIterator[*adk.AgentEvent] {
+			supervisorRunCount++
+			iter, gen := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+			go func() {
+				defer gen.Close()
+				if supervisorRunCount == 1 {
+					aMsg, tMsg := adk.GenTransferMessages(ctx, "Worker")
+					gen.Send(adk.EventFromMessage(aMsg, nil, schema.Assistant, ""))
+					event1 := adk.EventFromMessage(tMsg, nil, schema.Tool, tMsg.ToolName)
+					event1.Action = &adk.AgentAction{TransferToAgent: &adk.TransferToAgentAction{DestAgentName: "Worker"}}
+					gen.Send(event1)
+				} else {
+					exitEvent := &adk.AgentEvent{
+						AgentName: "Supervisor",
+						Action:    &adk.AgentAction{Exit: true},
+						Output: &adk.AgentOutput{
+							MessageOutput: &adk.MessageVariant{
+								Role:    schema.Assistant,
+								Message: schema.AssistantMessage("Supervisor done", nil),
+							},
+						},
+					}
+					gen.Send(exitEvent)
+				}
+			}()
+			return iter
+		}).AnyTimes()
+
+	// 2. Worker runs, calls AgentTool (InnerAgent)
+	// Mock WorkerModel behavior
+	workerModel.EXPECT().WithTools(gomock.Any()).Return(workerModel, nil).AnyTimes()
+
+	// 2.1 Worker generates tool call
+	toolCallMsg := schema.AssistantMessage("", []schema.ToolCall{
+		{
+			ID:   "call_inner_1",
+			Type: "function",
+			Function: schema.FunctionCall{
+				Name:      "InnerAgent",
+				Arguments: `{"request": "do exit"}`,
+			},
+		},
+	})
+	workerModel.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(toolCallMsg, nil).Times(1)
+
+	// 2.2 InnerAgent runs and emits Exit
+	innerAgent.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, input *adk.AgentInput, opts ...adk.AgentRunOption) *adk.AsyncIterator[*adk.AgentEvent] {
+			iter, gen := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+			go func() {
+				defer gen.Close()
+				innerExitEvent := &adk.AgentEvent{
+					AgentName: "InnerAgent",
+					Action:    &adk.AgentAction{Exit: true},
+					RunPath:   []adk.RunStep{},
+					Output: &adk.AgentOutput{
+						MessageOutput: &adk.MessageVariant{
+							Role:    schema.Assistant,
+							Message: schema.AssistantMessage("Inner Exiting...", nil),
+						},
+					},
+				}
+				gen.Send(innerExitEvent)
+			}()
+			return iter
+		}).AnyTimes()
+
+	// 2.3 Worker receives tool result (empty string or whatever AgentTool returns on exit/interrupt)
+	// AgentTool implementation details: if Exit action is present, it returns whatever output is there.
+	// The Exit action itself is passed as internal event.
+
+	// 2.4 Worker generates final response
+	finalMsg := schema.AssistantMessage("Worker Finished", nil)
+	workerModel.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(finalMsg, nil).AnyTimes()
+
+	// Build Worker Agent
+	agentTool := adk.NewAgentTool(ctx, innerAgent)
+	workerAgent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        "Worker",
+		Description: "Worker Agent",
+		Model:       workerModel,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools: []tool.BaseTool{agentTool},
+			},
+			EmitInternalEvents: true, // Key configuration
+		},
+	})
+	assert.NoError(t, err)
+
+	// Build System
+	sys, err := New(ctx, &Config{
+		Supervisor: supervisorAgent,
+		SubAgents:  []adk.Agent{workerAgent},
+	})
+	assert.NoError(t, err)
+
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: sys})
+	aIter := runner.Run(ctx, []adk.Message{schema.UserMessage("start")})
+
+	// Collect events
+	var events []*adk.AgentEvent
+	for {
+		event, ok := aIter.Next()
+		if !ok {
+			break
+		}
+		events = append(events, event)
+	}
+
+	foundInnerExit := false
+	foundTransferBack := false
+
+	for _, e := range events {
+		// Check for InnerAgent exit event (propagated as internal event)
+		if e.AgentName == "InnerAgent" && e.Action != nil && e.Action.Exit {
+			foundInnerExit = true
+		}
+
+		// Check for transfer back to Supervisor
+		if e.AgentName == "Worker" && e.Action != nil && e.Action.TransferToAgent != nil &&
+			e.Action.TransferToAgent.DestAgentName == "Supervisor" {
+			foundTransferBack = true
+		}
+	}
+
+	assert.True(t, foundInnerExit, "Should have captured InnerAgent Exit event")
+	assert.True(t, foundTransferBack, "Should have found Transfer back to Supervisor (Worker should NOT be considered exited)")
+}
+
+func TestSupervisorContainerUnifiedTracing(t *testing.T) {
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	supervisorModel := mockModel.NewMockToolCallingChatModel(ctrl)
+	subAgentModel := mockModel.NewMockToolCallingChatModel(ctrl)
+
+	supervisorModel.EXPECT().WithTools(gomock.Any()).Return(supervisorModel, nil).AnyTimes()
+	subAgentModel.EXPECT().WithTools(gomock.Any()).Return(subAgentModel, nil).AnyTimes()
+
+	transferMsg := schema.AssistantMessage("", []schema.ToolCall{
+		{
+			ID:   "transfer_1",
+			Type: "function",
+			Function: schema.FunctionCall{
+				Name:      "transfer_to_agent",
+				Arguments: `{"agent_name":"SubAgent"}`,
+			},
+		},
+	})
+	supervisorModel.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(transferMsg, nil).Times(1)
+
+	subAgentResponse := schema.AssistantMessage("SubAgent response", nil)
+	subAgentModel.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(subAgentResponse, nil).Times(1)
+
+	finalResponse := schema.AssistantMessage("Final response", nil)
+	supervisorModel.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(finalResponse, nil).Times(1)
+
+	supervisorAgent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        "SupervisorAgent",
+		Description: "Supervisor agent",
+		Instruction: "You are a supervisor",
+		Model:       supervisorModel,
+	})
+	assert.NoError(t, err)
+
+	subAgent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        "SubAgent",
+		Description: "Sub agent",
+		Instruction: "You are a sub agent",
+		Model:       subAgentModel,
+	})
+	assert.NoError(t, err)
+
+	multiAgent, err := New(ctx, &Config{
+		Supervisor: supervisorAgent,
+		SubAgents:  []adk.Agent{subAgent},
+	})
+	assert.NoError(t, err)
+
+	assert.Equal(t, "SupervisorAgent", multiAgent.Name(ctx))
+
+	typer, ok := multiAgent.(components.Typer)
+	assert.True(t, ok, "Should implement components.Typer")
+	assert.Equal(t, "Supervisor", typer.GetType())
+
+	var mu sync.Mutex
+	var onStartCalls []string
+	var onEndCalls []string
+
+	handler := callbacks.NewHandlerBuilder().
+		OnStartFn(func(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+			if info.Component != adk.ComponentOfAgent {
+				return ctx
+			}
+			mu.Lock()
+			onStartCalls = append(onStartCalls, info.Name+":"+info.Type)
+			mu.Unlock()
+			return ctx
+		}).
+		OnEndFn(func(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
+			if info.Component != adk.ComponentOfAgent {
+				return ctx
+			}
+			mu.Lock()
+			onEndCalls = append(onEndCalls, info.Name+":"+info.Type)
+			mu.Unlock()
+			if agentOutput := adk.ConvAgentCallbackOutput(output); agentOutput != nil && agentOutput.Events != nil {
+				go func() {
+					for {
+						_, ok := agentOutput.Events.Next()
+						if !ok {
+							break
+						}
+					}
+				}()
+			}
+			return ctx
+		}).
+		Build()
+
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: multiAgent})
+	iter := runner.Query(ctx, "hello", adk.WithCallbacks(handler))
+
+	for {
+		_, ok := iter.Next()
+		if !ok {
+			break
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	assert.NotEmpty(t, onStartCalls, "Should have OnStart calls")
+	assert.Contains(t, onStartCalls, "SupervisorAgent:Supervisor", "Should have supervisor container OnStart with type 'Supervisor'")
+}
+
+type traceContextKey struct{}
+
+func TestSupervisorContainerUnifiedTracingOnResume(t *testing.T) {
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	supervisorModel := mockModel.NewMockToolCallingChatModel(ctrl)
+	workerModel := mockModel.NewMockToolCallingChatModel(ctrl)
+
+	supervisorModel.EXPECT().WithTools(gomock.Any()).Return(supervisorModel, nil).AnyTimes()
+	workerModel.EXPECT().WithTools(gomock.Any()).Return(workerModel, nil).AnyTimes()
+
+	paymentTool := &approvableTool{name: "process_payment", t: t}
+
+	workerToolCallMsg := schema.AssistantMessage("", []schema.ToolCall{
+		{
+			ID:   "call_payment_1",
+			Type: "function",
+			Function: schema.FunctionCall{
+				Name:      "process_payment",
+				Arguments: `{"action": "process $1000 payment"}`,
+			},
+		},
+	})
+	workerModel.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(workerToolCallMsg, nil).Times(1)
+
+	workerCompletionMsg := schema.AssistantMessage("Payment processed successfully", nil)
+	workerModel.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(workerCompletionMsg, nil).AnyTimes()
+
+	workerAgent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        "Worker",
+		Description: "Worker agent",
+		Instruction: "You are a worker",
+		Model:       workerModel,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools: []tool.BaseTool{paymentTool},
+			},
+		},
+	})
+	assert.NoError(t, err)
+
+	transferMsg := schema.AssistantMessage("", []schema.ToolCall{
+		{
+			ID:   "transfer_1",
+			Type: "function",
+			Function: schema.FunctionCall{
+				Name:      "transfer_to_agent",
+				Arguments: `{"agent_name":"Worker"}`,
+			},
+		},
+	})
+	supervisorModel.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(transferMsg, nil).Times(1)
+
+	finalResponse := schema.AssistantMessage("Final response", nil)
+	supervisorModel.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(finalResponse, nil).AnyTimes()
+
+	supervisorAgent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        "SupervisorAgent",
+		Description: "Supervisor agent",
+		Instruction: "You are a supervisor",
+		Model:       supervisorModel,
+		Exit:        &adk.ExitTool{},
+	})
+	assert.NoError(t, err)
+
+	multiAgent, err := New(ctx, &Config{
+		Supervisor: supervisorAgent,
+		SubAgents:  []adk.Agent{workerAgent},
+	})
+	assert.NoError(t, err)
+
+	store := newCheckpointStore()
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{
+		Agent:           multiAgent,
+		CheckPointStore: store,
+	})
+
+	var mu sync.Mutex
+	var runOnStartCalls []string
+	var resumeOnStartCalls []string
+	var resumeParentTraceIDs []string
+
+	runHandler := callbacks.NewHandlerBuilder().
+		OnStartFn(func(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+			if info.Component != adk.ComponentOfAgent {
+				return ctx
+			}
+			mu.Lock()
+			runOnStartCalls = append(runOnStartCalls, info.Name+":"+info.Type)
+			mu.Unlock()
+			return ctx
+		}).
+		OnEndFn(func(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
+			if info.Component != adk.ComponentOfAgent {
+				return ctx
+			}
+			if agentOutput := adk.ConvAgentCallbackOutput(output); agentOutput != nil && agentOutput.Events != nil {
+				go func() {
+					for {
+						_, ok := agentOutput.Events.Next()
+						if !ok {
+							break
+						}
+					}
+				}()
+			}
+			return ctx
+		}).
+		Build()
+
+	checkpointID := "test-unified-tracing-resume"
+	iter := runner.Run(ctx, []adk.Message{schema.UserMessage("Process payment")}, adk.WithCallbacks(runHandler), adk.WithCheckPointID(checkpointID))
+
+	var interruptEvent *adk.AgentEvent
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if event.Action != nil && event.Action.Interrupted != nil {
+			interruptEvent = event
+			break
+		}
+	}
+
+	assert.NotNil(t, interruptEvent, "Should have interrupt event")
+
+	var toolInterruptID string
+	for _, intCtx := range interruptEvent.Action.Interrupted.InterruptContexts {
+		if intCtx.IsRootCause {
+			toolInterruptID = intCtx.ID
+			break
+		}
+	}
+	assert.NotEmpty(t, toolInterruptID, "Should have a root cause interrupt ID")
+
+	mu.Lock()
+	t.Logf("Run OnStart calls: %v", runOnStartCalls)
+	assert.Contains(t, runOnStartCalls, "SupervisorAgent:Supervisor", "Run should have supervisor container OnStart")
+	mu.Unlock()
+
+	resumeHandler := callbacks.NewHandlerBuilder().
+		OnStartFn(func(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+			if info.Component != adk.ComponentOfAgent {
+				return ctx
+			}
+			mu.Lock()
+			resumeOnStartCalls = append(resumeOnStartCalls, info.Name+":"+info.Type)
+			parentID, _ := ctx.Value(traceContextKey{}).(string)
+			resumeParentTraceIDs = append(resumeParentTraceIDs, info.Name+":parent="+parentID)
+			mu.Unlock()
+			if info.Type == "Supervisor" {
+				return context.WithValue(ctx, traceContextKey{}, "supervisor-trace-id")
+			}
+			return ctx
+		}).
+		OnEndFn(func(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
+			if info.Component != adk.ComponentOfAgent {
+				return ctx
+			}
+			if agentOutput := adk.ConvAgentCallbackOutput(output); agentOutput != nil && agentOutput.Events != nil {
+				go func() {
+					for {
+						_, ok := agentOutput.Events.Next()
+						if !ok {
+							break
+						}
+					}
+				}()
+			}
+			return ctx
+		}).
+		Build()
+
+	resumeIter, err := runner.ResumeWithParams(ctx, checkpointID, &adk.ResumeParams{
+		Targets: map[string]any{
+			toolInterruptID: &approvalResult{Approved: true},
+		},
+	}, adk.WithCallbacks(resumeHandler))
+	assert.NoError(t, err)
+
+	for {
+		event, ok := resumeIter.Next()
+		if !ok {
+			break
+		}
+		assert.NoError(t, event.Err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	t.Logf("Resume OnStart calls: %v", resumeOnStartCalls)
+	t.Logf("Resume parent trace IDs: %v", resumeParentTraceIDs)
+	assert.NotEmpty(t, resumeOnStartCalls, "Should have OnStart calls during resume")
+	assert.Contains(t, resumeOnStartCalls, "SupervisorAgent:Supervisor", "Resume should have supervisor container OnStart with type 'Supervisor'")
+
+	foundInnerSupervisorWithParent := false
+	for _, entry := range resumeParentTraceIDs {
+		if strings.Contains(entry, "SupervisorAgent") && !strings.Contains(entry, "parent=supervisor-trace-id") && entry != "SupervisorAgent:parent=" {
+			if strings.Contains(resumeOnStartCalls[0], "Supervisor") {
+				continue
+			}
+		}
+		if strings.Contains(entry, "parent=supervisor-trace-id") {
+			foundInnerSupervisorWithParent = true
+		}
+	}
+	assert.True(t, foundInnerSupervisorWithParent,
+		"Inner agents should have parent trace from Supervisor container during Resume. Got: %v", resumeParentTraceIDs)
 }

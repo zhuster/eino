@@ -42,4 +42,25 @@ output/*
 # Trae files
 .trae
 
+# Specs files (internal documentation)
+**/specs/
+
+# Reports (generated analysis files)
+reports/
+/todos
+
 .DS_Store
+*.log*
+.claude
+CLAUDE.md
+*.jsonl
+*.txt
+.agents/
+
+# Specs directories
+*/specs
+/todos
+/.claude/
+
+# Internal dev setup (not for public repo)
+/scripts/dev_setup_internal.sh

@@ -17,10 +17,12 @@
 package adk
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -30,6 +32,37 @@ import (
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 )
+
+type interruptTestToolsHandler struct {
+	*BaseChatModelAgentMiddleware
+	tools []tool.BaseTool
+}
+
+func TestPreprocessADKCheckpoint(t *testing.T) {
+	t.Run("no-op when missing markers", func(t *testing.T) {
+		in := []byte("random")
+		out := preprocessADKCheckpoint(append([]byte(nil), in...))
+		assert.Equal(t, in, out)
+	})
+
+	t.Run("rewrite legacy name for v0.8.0-v0.8.3", func(t *testing.T) {
+		const (
+			lenPrefixedReactStateName         = "\x15" + stateGobNameV07
+			lenPrefixedCompatName             = "\x15" + stateGobNameV080
+			lenPrefixedStateSerializationName = "\x12stateSerialization"
+		)
+
+		in := []byte(lenPrefixedReactStateName + "xxx" + lenPrefixedStateSerializationName + "yyy")
+		out := preprocessADKCheckpoint(append([]byte(nil), in...))
+		assert.True(t, bytes.Contains(out, []byte(lenPrefixedCompatName)))
+		assert.False(t, bytes.Contains(out, []byte(lenPrefixedReactStateName)))
+	})
+}
+
+func (h *interruptTestToolsHandler) BeforeAgent(ctx context.Context, runCtx *ChatModelAgentContext) (context.Context, *ChatModelAgentContext, error) {
+	runCtx.Tools = append(runCtx.Tools, h.tools...)
+	return ctx, runCtx, nil
+}
 
 func TestSaveAgentEventWrapper(t *testing.T) {
 	sr, sw := schema.Pipe[Message](1)
@@ -68,6 +101,68 @@ func TestSaveAgentEventWrapper(t *testing.T) {
 	w1 := &agentEventWrapper{}
 	err = w1.GobDecode(buf)
 	assert.NoError(t, err)
+}
+
+func TestInterruptFunctionsPopulateInterruptContextsImmediately(t *testing.T) {
+	ctx := context.Background()
+	ctx, _ = initRunCtx(ctx, "TestAgent", &AgentInput{Messages: []Message{}})
+	ctx = AppendAddressSegment(ctx, AddressSegmentAgent, "TestAgent")
+
+	t.Run("Interrupt populates InterruptContexts", func(t *testing.T) {
+		event := Interrupt(ctx, "test info")
+		assert.NotNil(t, event.Action)
+		assert.NotNil(t, event.Action.Interrupted)
+		assert.NotNil(t, event.Action.Interrupted.InterruptContexts)
+		assert.Equal(t, 1, len(event.Action.Interrupted.InterruptContexts))
+		assert.Equal(t, "test info", event.Action.Interrupted.InterruptContexts[0].Info)
+		assert.True(t, event.Action.Interrupted.InterruptContexts[0].IsRootCause)
+		assert.Equal(t, Address{
+			{Type: AddressSegmentAgent, ID: "TestAgent"},
+		}, event.Action.Interrupted.InterruptContexts[0].Address)
+	})
+
+	t.Run("StatefulInterrupt populates InterruptContexts", func(t *testing.T) {
+		event := StatefulInterrupt(ctx, "stateful info", "my state")
+		assert.NotNil(t, event.Action)
+		assert.NotNil(t, event.Action.Interrupted)
+		assert.NotNil(t, event.Action.Interrupted.InterruptContexts)
+		assert.Equal(t, 1, len(event.Action.Interrupted.InterruptContexts))
+		assert.Equal(t, "stateful info", event.Action.Interrupted.InterruptContexts[0].Info)
+		assert.True(t, event.Action.Interrupted.InterruptContexts[0].IsRootCause)
+	})
+
+	t.Run("CompositeInterrupt populates InterruptContexts with filtered parent chain", func(t *testing.T) {
+		subCtx := AppendAddressSegment(ctx, AddressSegmentAgent, "SubAgent")
+		subEvent := Interrupt(subCtx, "sub info")
+		event := CompositeInterrupt(ctx, "composite info", "composite state", subEvent.Action.internalInterrupted)
+		assert.NotNil(t, event.Action)
+		assert.NotNil(t, event.Action.Interrupted)
+		assert.NotNil(t, event.Action.Interrupted.InterruptContexts)
+		assert.Equal(t, 1, len(event.Action.Interrupted.InterruptContexts))
+
+		rootCause := event.Action.Interrupted.InterruptContexts[0]
+		assert.Equal(t, "sub info", rootCause.Info)
+		assert.True(t, rootCause.IsRootCause)
+		assert.Equal(t, Address{
+			{Type: AddressSegmentAgent, ID: "TestAgent"},
+			{Type: AddressSegmentAgent, ID: "SubAgent"},
+		}, rootCause.Address)
+
+		assert.NotNil(t, rootCause.Parent, "Parent should not be nil for composite interrupt")
+		assert.Equal(t, "composite info", rootCause.Parent.Info)
+		assert.Equal(t, Address{
+			{Type: AddressSegmentAgent, ID: "TestAgent"},
+		}, rootCause.Parent.Address)
+	})
+
+	t.Run("Address only contains agent/tool segments", func(t *testing.T) {
+		event := Interrupt(ctx, "test info")
+		addr := event.Action.Interrupted.InterruptContexts[0].Address
+		for _, seg := range addr {
+			assert.True(t, seg.Type == AddressSegmentAgent || seg.Type == AddressSegmentTool,
+				"Address should only contain agent/tool segments, got: %s", seg.Type)
+		}
+	})
 }
 
 func TestSimpleInterrupt(t *testing.T) {
@@ -921,9 +1016,10 @@ func TestWorkflowInterrupt(t *testing.T) {
 
 		var sa1InfoFound, sa2InfoFound bool
 		for _, ctx := range interruptEvent.Action.Interrupted.InterruptContexts {
-			if ctx.Info == "sa1 interrupt data" {
+			switch ctx.Info {
+			case "sa1 interrupt data":
 				sa1InfoFound = true
-			} else if ctx.Info == "sa2 interrupt data" {
+			case "sa2 interrupt data":
 				sa2InfoFound = true
 			}
 		}
@@ -934,9 +1030,10 @@ func TestWorkflowInterrupt(t *testing.T) {
 
 		var parallelInterruptID1, parallelInterruptID2 string
 		for _, ctx := range interruptEvent.Action.Interrupted.InterruptContexts {
-			if ctx.Info == "sa1 interrupt data" {
+			switch ctx.Info {
+			case "sa1 interrupt data":
 				parallelInterruptID1 = ctx.ID
-			} else if ctx.Info == "sa2 interrupt data" {
+			case "sa2 interrupt data":
 				parallelInterruptID2 = ctx.ID
 			}
 		}
@@ -993,9 +1090,9 @@ func TestChatModelInterrupt(t *testing.T) {
 		CheckPointStore: newMyStore(),
 	})
 	iter := runner.Query(ctx, "hello world", WithCheckPointID("1"))
-	event, ok := iter.Next()
+	_, ok := iter.Next()
 	assert.True(t, ok)
-	event, ok = iter.Next()
+	event, ok := iter.Next()
 	assert.True(t, ok)
 	assert.NoError(t, event.Err)
 	assert.NotNil(t, event.Action.Interrupted)
@@ -1020,7 +1117,7 @@ func TestChatModelInterrupt(t *testing.T) {
 		intCtx = intCtx.Parent
 	}
 
-	event, ok = iter.Next()
+	_, ok = iter.Next()
 	assert.False(t, ok)
 
 	iter, err = runner.ResumeWithParams(ctx, "1", &ResumeParams{
@@ -1109,13 +1206,13 @@ func TestChatModelAgentToolInterrupt(t *testing.T) {
 	})
 
 	iter := runner.Query(ctx, "hello world", WithCheckPointID("1"))
-	event, ok := iter.Next()
+	_, ok := iter.Next()
 	assert.True(t, ok)
-	event, ok = iter.Next()
+	event, ok := iter.Next()
 	assert.True(t, ok)
 	assert.NoError(t, event.Err)
 	assert.NotNil(t, event.Action.Interrupted)
-	event, ok = iter.Next()
+	_, ok = iter.Next()
 	assert.False(t, ok)
 
 	iter, err = runner.Resume(ctx, "1")
@@ -1145,7 +1242,7 @@ func TestChatModelAgentToolInterrupt(t *testing.T) {
 	}
 	assert.NotEmpty(t, toolInterruptID)
 
-	event, ok = iter.Next()
+	_, ok = iter.Next()
 	assert.False(t, ok)
 
 	iter, err = runner.ResumeWithParams(ctx, "1", &ResumeParams{
@@ -1187,8 +1284,6 @@ func (m *myStore) Get(_ context.Context, key string) ([]byte, bool, error) {
 }
 
 type myAgentOptions struct {
-	interrupt bool
-
 	value string
 }
 
@@ -1259,12 +1354,12 @@ func (m *myTool1) Info(_ context.Context) (*schema.ToolInfo, error) {
 }
 
 func (m *myTool1) InvokableRun(ctx context.Context, _ string, _ ...tool.Option) (string, error) {
-	if wasInterrupted, _, _ := compose.GetInterruptState[any](ctx); !wasInterrupted {
-		return "", compose.Interrupt(ctx, nil)
+	if wasInterrupted, _, _ := tool.GetInterruptState[any](ctx); !wasInterrupted {
+		return "", tool.Interrupt(ctx, nil)
 	}
 
-	if isResumeFlow, hasResumeData, data := compose.GetResumeContext[string](ctx); !isResumeFlow {
-		return "", compose.Interrupt(ctx, nil)
+	if isResumeFlow, hasResumeData, data := tool.GetResumeContext[string](ctx); !isResumeFlow {
+		return "", tool.Interrupt(ctx, nil)
 	} else if hasResumeData {
 		return data, nil
 	}
@@ -1435,15 +1530,15 @@ func init() {
 }
 
 func (m *myStatefulTool) InvokableRun(ctx context.Context, _ string, _ ...tool.Option) (string, error) {
-	wasInterrupted, hasState, state := compose.GetInterruptState[myStatefulToolState](ctx)
+	wasInterrupted, hasState, state := tool.GetInterruptState[myStatefulToolState](ctx)
 	if !wasInterrupted {
-		return "", compose.StatefulInterrupt(ctx, fmt.Sprintf("interrupt from %s", m.name), myStatefulToolState{InterruptCount: 1})
+		return "", tool.StatefulInterrupt(ctx, fmt.Sprintf("interrupt from %s", m.name), myStatefulToolState{InterruptCount: 1})
 	}
 
-	isResumeFlow, hasResumeData, data := compose.GetResumeContext[string](ctx)
+	isResumeFlow, hasResumeData, data := tool.GetResumeContext[string](ctx)
 	if !isResumeFlow || !hasResumeData {
 		assert.True(m.t, hasState, "tool %s should have interrupt state on resume", m.name)
-		return "", compose.StatefulInterrupt(ctx, fmt.Sprintf("interrupt from %s", m.name), myStatefulToolState{InterruptCount: state.InterruptCount + 1})
+		return "", tool.StatefulInterrupt(ctx, fmt.Sprintf("interrupt from %s", m.name), myStatefulToolState{InterruptCount: state.InterruptCount + 1})
 	}
 
 	return data, nil
@@ -1498,10 +1593,11 @@ func TestChatModelParallelToolInterruptAndResume(t *testing.T) {
 
 	var toolAInterruptID, toolBInterruptID string
 	for _, info := range interruptEvent.Action.Interrupted.InterruptContexts {
-		if info.Info == "interrupt from toolA" {
+		switch info.Info {
+		case "interrupt from toolA":
 			toolAInterruptID = info.ID
 			assert.True(t, info.IsRootCause)
-		} else if info.Info == "interrupt from toolB" {
+		case "interrupt from toolB":
 			toolBInterruptID = info.ID
 			assert.True(t, info.IsRootCause)
 		}
@@ -1696,9 +1792,10 @@ func TestNestedChatModelAgentWithAgentTool(t *testing.T) {
 		if event.Output != nil && event.Output.MessageOutput != nil {
 			if event.Output.MessageOutput.Message != nil {
 				content := event.Output.MessageOutput.Message.Content
-				if content == "inner agent completed" {
+				switch content {
+				case "inner agent completed":
 					foundInnerCompletion = true
-				} else if content == "outer agent completed" {
+				case "outer agent completed":
 					foundOuterCompletion = true
 				}
 			}
@@ -1723,4 +1820,330 @@ func consumeUntilInterrupt(iter *AsyncIterator[*AgentEvent]) (normalEvents []*Ag
 		normalEvents = append(normalEvents, event)
 	}
 	return
+}
+
+type returnDirectlyTool struct {
+	name string
+}
+
+func (t *returnDirectlyTool) Info(_ context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{
+		Name: t.name,
+		Desc: "A tool that returns directly",
+	}, nil
+}
+
+func (t *returnDirectlyTool) InvokableRun(_ context.Context, _ string, _ ...tool.Option) (string, error) {
+	return "return directly result", nil
+}
+
+type interruptingTool struct {
+	name string
+}
+
+func (i *interruptingTool) Info(_ context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{
+		Name: i.name,
+		Desc: "A tool that interrupts",
+	}, nil
+}
+
+func (i *interruptingTool) InvokableRun(ctx context.Context, _ string, _ ...tool.Option) (string, error) {
+	if wasInterrupted, _, _ := compose.GetInterruptState[any](ctx); !wasInterrupted {
+		return "", compose.Interrupt(ctx, "interrupt data")
+	}
+
+	if isResumeFlow, hasResumeData, data := compose.GetResumeContext[string](ctx); isResumeFlow && hasResumeData {
+		return data, nil
+	}
+
+	return "resumed without data", nil
+}
+
+type twoToolCallModel struct {
+	returnDirectlyToolName string
+	interruptingToolName   string
+	callCount              int
+	receivedTools          []*schema.ToolInfo
+	mu                     sync.Mutex
+}
+
+func (m *twoToolCallModel) Generate(_ context.Context, _ []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+	m.mu.Lock()
+	m.callCount++
+	callNum := m.callCount
+	options := model.GetCommonOptions(&model.Options{}, opts...)
+	if options.Tools != nil {
+		m.receivedTools = options.Tools
+	}
+	m.mu.Unlock()
+
+	if callNum == 1 {
+		return &schema.Message{
+			Role:    schema.Assistant,
+			Content: "",
+			ToolCalls: []schema.ToolCall{
+				{
+					ID:   "call_return_directly",
+					Type: "function",
+					Function: schema.FunctionCall{
+						Name:      m.returnDirectlyToolName,
+						Arguments: "{}",
+					},
+				},
+				{
+					ID:   "call_interrupting",
+					Type: "function",
+					Function: schema.FunctionCall{
+						Name:      m.interruptingToolName,
+						Arguments: "{}",
+					},
+				},
+			},
+		}, nil
+	}
+	return schema.AssistantMessage("final response", nil), nil
+}
+
+func (m *twoToolCallModel) Stream(_ context.Context, _ []*schema.Message, _ ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	panic("not implemented")
+}
+
+func (m *twoToolCallModel) WithTools(_ []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return m, nil
+}
+
+func (m *twoToolCallModel) GetReceivedTools() []*schema.ToolInfo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.receivedTools
+}
+
+type dynamicTool struct {
+	name string
+}
+
+func (t *dynamicTool) Info(_ context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{
+		Name: t.name,
+		Desc: "A dynamically added tool",
+	}, nil
+}
+
+func (t *dynamicTool) InvokableRun(_ context.Context, _ string, _ ...tool.Option) (string, error) {
+	return "dynamic tool result", nil
+}
+
+func TestReturnDirectlyEventSentAfterResume(t *testing.T) {
+	ctx := context.Background()
+
+	returnDirectlyToolName := "return_directly_tool"
+	interruptingToolName := "interrupting_tool"
+	dynamicToolName := "dynamic_tool"
+
+	mdl := &twoToolCallModel{
+		returnDirectlyToolName: returnDirectlyToolName,
+		interruptingToolName:   interruptingToolName,
+	}
+
+	agent, err := NewChatModelAgent(ctx, &ChatModelAgentConfig{
+		Name:        "TestAgent",
+		Description: "Test agent for return directly + interrupt",
+		Model:       mdl,
+		ToolsConfig: ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools: []tool.BaseTool{
+					&returnDirectlyTool{name: returnDirectlyToolName},
+					&interruptingTool{name: interruptingToolName},
+				},
+			},
+			ReturnDirectly: map[string]bool{
+				returnDirectlyToolName: true,
+			},
+		},
+		Handlers: []ChatModelAgentMiddleware{
+			&interruptTestToolsHandler{tools: []tool.BaseTool{&dynamicTool{name: dynamicToolName}}},
+		},
+	})
+	assert.NoError(t, err)
+
+	store := newMyStore()
+	runner := NewRunner(ctx, RunnerConfig{
+		Agent:           agent,
+		EnableStreaming: false,
+		CheckPointStore: store,
+	})
+
+	iter := runner.Query(ctx, "test input", WithCheckPointID("test_checkpoint"))
+
+	var interruptEvent *AgentEvent
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if event.Action != nil && event.Action.Interrupted != nil {
+			interruptEvent = event
+		}
+	}
+
+	assert.NotNil(t, interruptEvent, "Should have an interrupt event")
+	assert.NotEmpty(t, interruptEvent.Action.Interrupted.InterruptContexts)
+
+	receivedToolsBeforeResume := mdl.GetReceivedTools()
+	var hasDynamicToolBeforeResume bool
+	for _, ti := range receivedToolsBeforeResume {
+		if ti.Name == dynamicToolName {
+			hasDynamicToolBeforeResume = true
+		}
+	}
+	assert.True(t, hasDynamicToolBeforeResume, "Dynamic tool should be in tool list before interrupt")
+
+	interruptID := interruptEvent.Action.Interrupted.InterruptContexts[0].ID
+	resumeIter, err := runner.ResumeWithParams(ctx, "test_checkpoint", &ResumeParams{
+		Targets: map[string]any{
+			interruptID: "resume data",
+		},
+	})
+	assert.NoError(t, err)
+
+	var resumeEvents []*AgentEvent
+	for {
+		event, ok := resumeIter.Next()
+		if !ok {
+			break
+		}
+		resumeEvents = append(resumeEvents, event)
+	}
+
+	var hasReturnDirectlyEvent bool
+	for _, e := range resumeEvents {
+		if e.Output != nil && e.Output.MessageOutput != nil {
+			if e.Output.MessageOutput.Role == schema.Tool && e.Output.MessageOutput.ToolName == returnDirectlyToolName {
+				hasReturnDirectlyEvent = true
+			}
+		}
+	}
+	assert.True(t, hasReturnDirectlyEvent, "ReturnDirectlyEvent should be sent after resume")
+
+	receivedToolsAfterResume := mdl.GetReceivedTools()
+	var hasDynamicToolAfterResume bool
+	for _, ti := range receivedToolsAfterResume {
+		if ti.Name == dynamicToolName {
+			hasDynamicToolAfterResume = true
+		}
+	}
+	assert.True(t, hasDynamicToolAfterResume, "Dynamic tool should be in tool list after resume (bc.toolUpdated path)")
+}
+
+// streamErrorThenToolCallModel simulates a model that:
+// - On the first Stream call: emits several good chunks then an error (triggering retry)
+// - On the second Stream call (retry): returns a tool call message (success)
+type streamErrorThenToolCallModel struct {
+	callCount    int32
+	toolCallName string
+}
+
+func (m *streamErrorThenToolCallModel) Generate(_ context.Context, _ []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	return schema.AssistantMessage("final answer", nil), nil
+}
+
+func (m *streamErrorThenToolCallModel) Stream(_ context.Context, _ []*schema.Message, _ ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	count := atomic.AddInt32(&m.callCount, 1)
+
+	sr, sw := schema.Pipe[*schema.Message](10)
+	go func() {
+		defer sw.Close()
+		if count == 1 {
+			// First call: emit good chunks then error
+			sw.Send(schema.AssistantMessage("chunk1", nil), nil)
+			sw.Send(schema.AssistantMessage("chunk2", nil), nil)
+			sw.Send(schema.AssistantMessage("chunk3", nil), nil)
+			sw.Send(nil, errRetryAble)
+			return
+		}
+		// Second call (retry): return tool call
+		sw.Send(schema.AssistantMessage("", []schema.ToolCall{{
+			ID:       "call-1",
+			Function: schema.FunctionCall{Name: m.toolCallName, Arguments: "{}"},
+		}}), nil)
+	}()
+	return sr, nil
+}
+
+func (m *streamErrorThenToolCallModel) WithTools(_ []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return m, nil
+}
+
+// TestStreamRetryThenToolInterruptCheckpoint reproduces a bug where:
+//  1. ChatModelAgent with ModelRetryConfig.MaxRetries = 2
+//  2. First model Stream call emits good chunks then a retryable error
+//  3. Retry succeeds, model returns a tool call
+//  4. The tool triggers an interrupt, causing the Runner to save a checkpoint
+//  5. The checkpoint save fails because the first (failed) model call's stream event
+//     is in the session, and when MessageVariant.GobEncode consumes the stream,
+//     it hits the error chunk and returns an encoding error.
+func TestStreamRetryThenToolInterruptCheckpoint(t *testing.T) {
+	ctx := context.Background()
+
+	interruptToolName := "interrupt_tool"
+	mdl := &streamErrorThenToolCallModel{toolCallName: interruptToolName}
+
+	interruptTool := &interruptingTool{name: interruptToolName}
+
+	agent, err := NewChatModelAgent(ctx, &ChatModelAgentConfig{
+		Name:        "RetryInterruptAgent",
+		Description: "Agent that retries model then tool interrupts",
+		Instruction: "You are a test agent.",
+		Model:       mdl,
+		ModelRetryConfig: &ModelRetryConfig{
+			MaxRetries:  2,
+			IsRetryAble: func(ctx context.Context, err error) bool { return errors.Is(err, errRetryAble) },
+		},
+		ToolsConfig: ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools: []tool.BaseTool{interruptTool},
+			},
+		},
+	})
+	assert.NoError(t, err)
+
+	store := newMyStore()
+	runner := NewRunner(ctx, RunnerConfig{
+		Agent:           agent,
+		EnableStreaming: true,
+		CheckPointStore: store,
+	})
+
+	iter := runner.Run(ctx, []Message{schema.UserMessage("test query")}, WithCheckPointID("retry_interrupt_ckpt"))
+
+	var events []*AgentEvent
+	var checkpointErr error
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			break
+		}
+		events = append(events, event)
+		if event.Err != nil {
+			checkpointErr = event.Err
+			t.Logf("event error: %v", event.Err)
+		}
+	}
+
+	// The bug: checkpoint save fails because the failed stream's error chunk
+	// is encountered during gob encoding of the session events.
+	// If the bug is fixed, checkpointErr should be nil and we should see an interrupt event.
+	assert.NoError(t, checkpointErr, "checkpoint save should not fail due to failed stream's error in session")
+
+	var hasInterrupt bool
+	for _, event := range events {
+		if event.Action != nil && event.Action.Interrupted != nil {
+			hasInterrupt = true
+		}
+	}
+	assert.True(t, hasInterrupt, "should receive an interrupt event from the tool")
+
+	// Verify the model was called twice (first call errored, second succeeded)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&mdl.callCount), "model should be called exactly twice (1 failure + 1 retry)")
 }

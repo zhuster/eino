@@ -22,6 +22,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/cloudwego/eino/internal/core"
 	"github.com/cloudwego/eino/schema"
@@ -53,20 +54,63 @@ type InterruptInfo struct {
 	InterruptContexts []*InterruptCtx
 }
 
+// TypedInterrupt creates a typed interrupt event that pauses execution to request external input.
+// It is the generic counterpart of Interrupt; see Interrupt for full documentation.
+func TypedInterrupt[M MessageType](ctx context.Context, info any) *TypedAgentEvent[M] {
+	var rp []RunStep
+	rCtx := getRunCtx(ctx)
+	if rCtx != nil {
+		rp = rCtx.RunPath
+	}
+
+	is, err := core.Interrupt(ctx, info, nil, nil,
+		core.WithLayerPayload(rp))
+	if err != nil {
+		return &TypedAgentEvent[M]{Err: err}
+	}
+
+	contexts := core.ToInterruptContexts(is, allowedAddressSegmentTypes)
+
+	return &TypedAgentEvent[M]{
+		Action: &AgentAction{
+			Interrupted: &InterruptInfo{
+				InterruptContexts: contexts,
+			},
+			internalInterrupted: is,
+		},
+	}
+}
+
 // Interrupt creates a basic interrupt action.
 // This is used when an agent needs to pause its execution to request external input or intervention,
 // but does not need to save any internal state to be restored upon resumption.
 // The `info` parameter is user-facing data that describes the reason for the interrupt.
 func Interrupt(ctx context.Context, info any) *AgentEvent {
-	is, err := core.Interrupt(ctx, info, nil, nil,
-		core.WithLayerPayload(getRunCtx(ctx).RunPath))
-	if err != nil {
-		return &AgentEvent{Err: err}
+	return TypedInterrupt[*schema.Message](ctx, info)
+}
+
+// TypedStatefulInterrupt creates a typed interrupt event that also saves the agent's internal state.
+// It is the generic counterpart of StatefulInterrupt; see StatefulInterrupt for full documentation.
+func TypedStatefulInterrupt[M MessageType](ctx context.Context, info any, state any) *TypedAgentEvent[M] {
+	var rp []RunStep
+	rCtx := getRunCtx(ctx)
+	if rCtx != nil {
+		rp = rCtx.RunPath
 	}
 
-	return &AgentEvent{
+	is, err := core.Interrupt(ctx, info, state, nil,
+		core.WithLayerPayload(rp))
+	if err != nil {
+		return &TypedAgentEvent[M]{Err: err}
+	}
+
+	contexts := core.ToInterruptContexts(is, allowedAddressSegmentTypes)
+
+	return &TypedAgentEvent[M]{
 		Action: &AgentAction{
-			Interrupted:         &InterruptInfo{},
+			Interrupted: &InterruptInfo{
+				InterruptContexts: contexts,
+			},
 			internalInterrupted: is,
 		},
 	}
@@ -77,40 +121,41 @@ func Interrupt(ctx context.Context, info any) *AgentEvent {
 // The `info` parameter is user-facing data describing the interrupt.
 // The `state` parameter is the agent's internal state object, which will be serialized and stored.
 func StatefulInterrupt(ctx context.Context, info any, state any) *AgentEvent {
-	is, err := core.Interrupt(ctx, info, state, nil,
-		core.WithLayerPayload(getRunCtx(ctx).RunPath))
-	if err != nil {
-		return &AgentEvent{Err: err}
+	return TypedStatefulInterrupt[*schema.Message](ctx, info, state)
+}
+
+// TypedCompositeInterrupt creates a typed interrupt event that aggregates sub-interrupt signals.
+// It is the generic counterpart of CompositeInterrupt; see CompositeInterrupt for full documentation.
+func TypedCompositeInterrupt[M MessageType](ctx context.Context, info any, state any,
+	subInterruptSignals ...*InterruptSignal) *TypedAgentEvent[M] {
+	var rp []RunStep
+	rCtx := getRunCtx(ctx)
+	if rCtx != nil {
+		rp = rCtx.RunPath
 	}
 
-	return &AgentEvent{
+	is, err := core.Interrupt(ctx, info, state, subInterruptSignals,
+		core.WithLayerPayload(rp))
+	if err != nil {
+		return &TypedAgentEvent[M]{Err: err}
+	}
+
+	contexts := core.ToInterruptContexts(is, allowedAddressSegmentTypes)
+
+	return &TypedAgentEvent[M]{
 		Action: &AgentAction{
-			Interrupted:         &InterruptInfo{},
+			Interrupted: &InterruptInfo{
+				InterruptContexts: contexts,
+			},
 			internalInterrupted: is,
 		},
 	}
 }
 
-// CompositeInterrupt creates an interrupt action for a workflow agent.
-// It combines the interrupts from one or more of its sub-agents into a single, cohesive interrupt.
-// This is used by workflow agents (like Sequential, Parallel, or Loop) to propagate interrupts from their children.
-// The `info` parameter is user-facing data describing the workflow's own reason for interrupting.
-// The `state` parameter is the workflow agent's own state (e.g., the index of the sub-agent that was interrupted).
-// The `subInterruptSignals` is a variadic list of the InterruptSignal objects from the interrupted sub-agents.
+// CompositeInterrupt creates an interrupt event that aggregates sub-interrupt signals.
 func CompositeInterrupt(ctx context.Context, info any, state any,
 	subInterruptSignals ...*InterruptSignal) *AgentEvent {
-	is, err := core.Interrupt(ctx, info, state, subInterruptSignals,
-		core.WithLayerPayload(getRunCtx(ctx).RunPath))
-	if err != nil {
-		return &AgentEvent{Err: err}
-	}
-
-	return &AgentEvent{
-		Action: &AgentAction{
-			Interrupted:         &InterruptInfo{},
-			internalInterrupted: is,
-		},
-	}
+	return TypedCompositeInterrupt[*schema.Message](ctx, info, state, subInterruptSignals...)
 }
 
 // Address represents the unique, hierarchical address of a component within an execution.
@@ -125,19 +170,11 @@ const (
 	AddressSegmentTool  AddressSegmentType = "tool"
 )
 
+var allowedAddressSegmentTypes = []AddressSegmentType{AddressSegmentAgent, AddressSegmentTool}
+
 // AppendAddressSegment adds an address segment for the current execution context.
 func AppendAddressSegment(ctx context.Context, segType AddressSegmentType, segID string) context.Context {
 	return core.AppendAddressSegment(ctx, segType, segID, "")
-}
-
-func encapsulateAddress(addr Address) Address {
-	newAddr := make(Address, 0, len(addr))
-	for _, seg := range addr {
-		if seg.Type == AddressSegmentAgent || seg.Type == AddressSegmentTool {
-			newAddr = append(newAddr, seg)
-		}
-	}
-	return newAddr
 }
 
 // InterruptCtx provides a structured, user-facing view of a single point of interruption.
@@ -161,7 +198,11 @@ func WithCheckPointID(id string) AgentRunOption {
 func init() {
 	schema.RegisterName[*serialization]("_eino_adk_serialization")
 	schema.RegisterName[*WorkflowInterruptInfo]("_eino_adk_workflow_interrupt_info")
-	schema.RegisterName[*State]("_eino_adk_react_state")
+	// Register []byte for gob: the cancel refactor routes bridge store checkpoint
+	// bytes ([]byte) through InterruptState.State (type any) inside the outer
+	// serialization struct. Gob requires concrete types behind interface fields
+	// to be registered.
+	gob.Register([]byte{})
 }
 
 // serialization CheckpointSchema: root checkpoint payload (gob).
@@ -175,15 +216,17 @@ type serialization struct {
 	InterruptID2State   map[string]core.InterruptState
 }
 
-func (r *Runner) loadCheckPoint(ctx context.Context, checkpointID string) (
+func runnerLoadCheckPointImpl(store CheckPointStore, ctx context.Context, checkpointID string) (
 	context.Context, *runContext, *ResumeInfo, error) {
-	data, existed, err := r.store.Get(ctx, checkpointID)
+	data, existed, err := store.Get(ctx, checkpointID)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to get checkpoint from store: %w", err)
 	}
 	if !existed {
 		return nil, nil, nil, fmt.Errorf("checkpoint[%s] not exist", checkpointID)
 	}
+
+	data = preprocessADKCheckpoint(data)
 
 	s := &serialization{}
 	err = gob.NewDecoder(bytes.NewReader(data)).Decode(s)
@@ -198,12 +241,57 @@ func (r *Runner) loadCheckPoint(ctx context.Context, checkpointID string) (
 	}, nil
 }
 
-func (r *Runner) saveCheckPoint(
+// preprocessADKCheckpoint fixes a gob incompatibility when resuming old ChatModelAgent/DeepAgents checkpoints.
+//
+// Background
+//   - ADK checkpoints are gob-encoded.
+//   - Some values inside checkpoints are stored as `any`, so gob includes a concrete type name
+//     string in the wire format and uses that name to pick the local Go type to decode into.
+//
+// Problem (v0.8.0-v0.8.3 checkpoints)
+//   - In v0.8.0-v0.8.3, *State was registered under the name "_eino_adk_react_state" AND
+//     implemented GobEncode/GobDecode, so the wire format for that name is "GobEncoder payload"
+//     (opaque bytes).
+//   - In v0.7.*, the same name "_eino_adk_react_state" was used but encoded as a normal struct
+//     (no GobEncode). Gob treats these two wire formats as incompatible.
+//   - Gob only allows one local Go type per name. Today we register "_eino_adk_react_state" to
+//     a v0.7-compatible struct decoder (stateV07). If we try to decode a v0.8.0-v0.8.3
+//     checkpoint under that same name, gob fails with a "want struct; got non-struct" mismatch.
+//
+// Solution
+//   - We keep "_eino_adk_react_state" mapped to the v0.7 decoder.
+//   - For v0.8.0-v0.8.3 checkpoints only, we rewrite the on-wire name to a same-length alias
+//     "_eino_adk_state_v080_", which is registered to a GobDecoder-compatible type (stateV080).
+//   - The alias is the same length as the original, so we can safely replace the length-prefixed
+//     bytes without re-encoding the whole stream.
+func preprocessADKCheckpoint(data []byte) []byte {
+	const (
+		lenPrefixedReactStateName         = "\x15" + stateGobNameV07
+		lenPrefixedCompatName             = "\x15" + stateGobNameV080
+		lenPrefixedStateSerializationName = "\x12stateSerialization"
+	)
+
+	// the following line checks whether the checkpoint is persisted through v0.8.0-v0.8.3
+	if !bytes.Contains(data, []byte(lenPrefixedReactStateName)) || !bytes.Contains(data, []byte(lenPrefixedStateSerializationName)) {
+		return data
+	}
+	return bytes.ReplaceAll(data,
+		[]byte(lenPrefixedReactStateName),
+		[]byte(lenPrefixedCompatName))
+}
+
+func runnerSaveCheckPointImpl(
+	enableStreaming bool,
+	store CheckPointStore,
 	ctx context.Context,
 	key string,
 	info *InterruptInfo,
 	is *core.InterruptSignal,
 ) error {
+	if store == nil {
+		return nil
+	}
+
 	runCtx := getRunCtx(ctx)
 
 	id2Addr, id2State := core.SignalToPersistenceMaps(is)
@@ -214,46 +302,51 @@ func (r *Runner) saveCheckPoint(
 		Info:                info,
 		InterruptID2Address: id2Addr,
 		InterruptID2State:   id2State,
-		EnableStreaming:     r.enableStreaming,
+		EnableStreaming:     enableStreaming,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to encode checkpoint: %w", err)
 	}
-	return r.store.Set(ctx, key, buf.Bytes())
+	return store.Set(ctx, key, buf.Bytes())
 }
 
 const bridgeCheckpointID = "adk_react_mock_key"
 
 func newBridgeStore() *bridgeStore {
-	return &bridgeStore{}
+	return &bridgeStore{data: make(map[string][]byte)}
 }
 
-func newResumeBridgeStore(data []byte) *bridgeStore {
+func newResumeBridgeStore(checkPointID string, data []byte) *bridgeStore {
 	return &bridgeStore{
-		Data:  data,
-		Valid: true,
+		data: map[string][]byte{checkPointID: data},
 	}
 }
 
 type bridgeStore struct {
-	Data  []byte
-	Valid bool
+	mu   sync.Mutex
+	data map[string][]byte
 }
 
-func (m *bridgeStore) Get(_ context.Context, _ string) ([]byte, bool, error) {
-	if m.Valid {
-		return m.Data, true, nil
+func (m *bridgeStore) Get(_ context.Context, key string) ([]byte, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if v, ok := m.data[key]; ok {
+		return v, true, nil
 	}
 	return nil, false, nil
 }
 
-func (m *bridgeStore) Set(_ context.Context, _ string, checkPoint []byte) error {
-	m.Data = checkPoint
-	m.Valid = true
+func (m *bridgeStore) Set(_ context.Context, key string, checkPoint []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.data == nil {
+		m.data = make(map[string][]byte)
+	}
+	m.data[key] = checkPoint
 	return nil
 }
 
-func getNextResumeAgent(ctx context.Context, info *ResumeInfo) (string, error) {
+func getNextResumeAgent(ctx context.Context, _ *ResumeInfo) (string, error) {
 	nextAgents, err := core.GetNextResumptionPoints(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to get next agent leading to interruption: %w", err)
@@ -278,7 +371,7 @@ func getNextResumeAgent(ctx context.Context, info *ResumeInfo) (string, error) {
 	return nextAgentID, nil
 }
 
-func getNextResumeAgents(ctx context.Context, info *ResumeInfo) (map[string]bool, error) {
+func getNextResumeAgents(ctx context.Context, _ *ResumeInfo) (map[string]bool, error) {
 	nextAgents, err := core.GetNextResumptionPoints(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get next agents leading to interruption: %w", err)

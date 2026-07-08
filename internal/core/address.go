@@ -88,7 +88,7 @@ type addrCtx struct {
 type globalResumeInfoKey struct{}
 
 type globalResumeInfo struct {
-	mu                sync.Mutex
+	mu                sync.RWMutex
 	id2ResumeData     map[string]any
 	id2ResumeDataUsed map[string]bool
 	id2State          map[string]InterruptState
@@ -147,24 +147,21 @@ func AppendAddressSegment(ctx context.Context, segType AddressSegmentType, segID
 		return context.WithValue(ctx, addrCtxKey{}, runCtx)
 	}
 
+	rInfo.mu.Lock()
+	defer rInfo.mu.Unlock()
+
 	var id string
 	for id_, addr := range rInfo.id2Addr {
 		if addr.Equals(currentAddress) {
-			rInfo.mu.Lock()
 			if used, ok := rInfo.id2StateUsed[id_]; !ok || !used {
 				runCtx.interruptState = generic.PtrOf(rInfo.id2State[id_])
 				rInfo.id2StateUsed[id_] = true
 				id = id_
-				rInfo.mu.Unlock()
 				break
 			}
-			rInfo.mu.Unlock()
 		}
 	}
 
-	// take from globalResumeInfo the data for the new address if there is any
-	rInfo.mu.Lock()
-	defer rInfo.mu.Unlock()
 	used := rInfo.id2ResumeDataUsed[id]
 	if !used {
 		rData, existed := rInfo.id2ResumeData[id]
@@ -172,6 +169,17 @@ func AppendAddressSegment(ctx context.Context, segType AddressSegmentType, segID
 			rInfo.id2ResumeDataUsed[id] = true
 			runCtx.resumeData = rData
 			runCtx.isResumeTarget = true
+		}
+	}
+
+	if !runCtx.isResumeTarget {
+		for id_, addr := range rInfo.id2Addr {
+			if len(addr) > len(currentAddress) && addr[:len(currentAddress)].Equals(currentAddress) {
+				if !rInfo.id2ResumeDataUsed[id_] {
+					runCtx.isResumeTarget = true
+					break
+				}
+			}
 		}
 	}
 
@@ -186,6 +194,9 @@ func GetNextResumptionPoints(ctx context.Context) (map[string]bool, error) {
 	if !exists {
 		return nil, fmt.Errorf("GetNextResumptionPoints: failed to get resume info from context")
 	}
+
+	rInfo.mu.RLock()
+	defer rInfo.mu.RUnlock()
 
 	nextPoints := make(map[string]bool)
 	parentAddrLen := len(parentAddr)
@@ -261,13 +272,21 @@ func PopulateInterruptState(ctx context.Context, id2Addr map[string]Address,
 	id2State map[string]InterruptState) context.Context {
 	rInfo, ok := ctx.Value(globalResumeInfoKey{}).(*globalResumeInfo)
 	if ok {
+		rInfo.mu.Lock()
+		defer rInfo.mu.Unlock()
+
 		if rInfo.id2Addr == nil {
 			rInfo.id2Addr = make(map[string]Address)
 		}
 		for id, addr := range id2Addr {
 			rInfo.id2Addr[id] = addr
 		}
-		rInfo.id2State = id2State
+		if rInfo.id2State == nil {
+			rInfo.id2State = make(map[string]InterruptState)
+		}
+		for id, state := range id2State {
+			rInfo.id2State[id] = state
+		}
 	} else {
 		rInfo = &globalResumeInfo{
 			id2Addr:           id2Addr,
@@ -284,17 +303,13 @@ func PopulateInterruptState(ctx context.Context, id2Addr map[string]Address,
 			if addr.Equals(runCtx.addr) {
 				if used, ok := rInfo.id2StateUsed[id_]; !ok || !used {
 					runCtx.interruptState = generic.PtrOf(rInfo.id2State[id_])
-					rInfo.mu.Lock()
 					rInfo.id2StateUsed[id_] = true
-					rInfo.mu.Unlock()
 				}
 
 				if used, ok := rInfo.id2ResumeDataUsed[id_]; !ok || !used {
 					runCtx.isResumeTarget = true
 					runCtx.resumeData = rInfo.id2ResumeData[id_]
-					rInfo.mu.Lock()
 					rInfo.id2ResumeDataUsed[id_] = true
-					rInfo.mu.Unlock()
 				}
 
 				break

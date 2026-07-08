@@ -22,24 +22,45 @@ import "github.com/cloudwego/eino/schema"
 type Options struct {
 	// Temperature is the temperature for the model, which controls the randomness of the model.
 	Temperature *float32
-	// MaxTokens is the max number of tokens, if reached the max tokens, the model will stop generating, and mostly return an finish reason of "length".
-	MaxTokens *int
 	// Model is the model name.
 	Model *string
 	// TopP is the top p for the model, which controls the diversity of the model.
 	TopP *float32
-	// Stop is the stop words for the model, which controls the stopping condition of the model.
-	Stop []string
 	// Tools is a list of tools the model may call.
 	Tools []*schema.ToolInfo
+	// DeferredTools is a list of tools to be registered with defer_loading=true
+	// for the model's built-in (server-side) tool search capability.
+	// These tools are sent to the model API but not loaded into context upfront —
+	// only their names and descriptions are visible to the model. The model's
+	// built-in tool search tool searches through them and loads matching ones
+	// on demand.
+	DeferredTools []*schema.ToolInfo
+
+	ToolSearchTool *schema.ToolInfo
+
+	// MaxTokens is the max number of tokens, if reached the max tokens, the model will stop generating, and mostly return a finish reason of "length".
+	MaxTokens *int
+	// Stop is the stop words for the model, which controls the stopping condition of the model.
+	Stop []string
+
+	// Options only available for chat model.
+
 	// ToolChoice controls which tool is called by the model.
 	ToolChoice *schema.ToolChoice
 	// AllowedToolNames specifies a list of tool names that the model is allowed to call.
 	// This allows for constraining the model to a specific subset of the available tools.
 	AllowedToolNames []string
+
+	// Options only available for agentic model.
+
+	// AgenticToolChoice controls how the agentic model calls tools.
+	AgenticToolChoice *schema.AgenticToolChoice
 }
 
-// Option is the call option for ChatModel component.
+// Option is a call-time option for a ChatModel. Options are immutable and
+// composable: each Option carries either a common-option setter (applied via
+// [GetCommonOptions]) or an implementation-specific setter (applied via
+// [GetImplSpecificOptions]), never both.
 type Option struct {
 	apply func(opts *Options)
 
@@ -103,8 +124,36 @@ func WithTools(tools []*schema.ToolInfo) Option {
 	}
 }
 
+// WithToolSearchTool is the option to register a tool search tool with the model.
+// When set, the model uses this tool to discover and load deferred tools on demand.
+// Note: The tool search tool should NOT be included in WithTools.
+func WithToolSearchTool(tool *schema.ToolInfo) Option {
+	return Option{
+		apply: func(opts *Options) {
+			opts.ToolSearchTool = tool
+		},
+	}
+}
+
+// WithDeferredTools is the option to set deferred tools for the model's
+// built-in (server-side) tool search. These tools are registered with
+// defer_loading=true so the model can discover and load them on demand
+// via its native tool search capability.
+// Note: Deferred tools should NOT be included in WithTools.
+func WithDeferredTools(tools []*schema.ToolInfo) Option {
+	if tools == nil {
+		tools = []*schema.ToolInfo{}
+	}
+	return Option{
+		apply: func(opts *Options) {
+			opts.DeferredTools = tools
+		},
+	}
+}
+
 // WithToolChoice sets the tool choice for the model. It also allows for providing a list of
 // tool names to constrain the model to a specific subset of the available tools.
+// Only available for ChatModel.
 func WithToolChoice(toolChoice schema.ToolChoice, allowedToolNames ...string) Option {
 	return Option{
 		apply: func(opts *Options) {
@@ -114,14 +163,51 @@ func WithToolChoice(toolChoice schema.ToolChoice, allowedToolNames ...string) Op
 	}
 }
 
+// WithAgenticToolChoice is the option to set tool choice for the agentic model.
+// Only available for AgenticModel.
+func WithAgenticToolChoice(toolChoice *schema.AgenticToolChoice) Option {
+	return Option{
+		apply: func(opts *Options) {
+			opts.AgenticToolChoice = toolChoice
+		},
+	}
+}
+
 // WrapImplSpecificOptFn is the option to wrap the implementation specific option function.
+// WrapImplSpecificOptFn wraps an implementation-specific option function into
+// an [Option] so it can be passed alongside standard options.
+//
+// This is intended for ChatModel implementors, not callers. Define a typed
+// setter for your own config struct and expose it as an Option:
+//
+//	// In your implementation package:
+//	func WithMyParam(v string) model.Option {
+//	    return model.WrapImplSpecificOptFn(func(o *MyOptions) {
+//	        o.MyParam = v
+//	    })
+//	}
+//
+// Callers can then mix standard and implementation-specific options freely:
+//
+//	model.Generate(ctx, msgs,
+//	    model.WithTemperature(0.7),
+//	    mypkg.WithMyParam("value"),
+//	)
 func WrapImplSpecificOptFn[T any](optFn func(*T)) Option {
 	return Option{
 		implSpecificOptFn: optFn,
 	}
 }
 
-// GetCommonOptions extract model Options from Option list, optionally providing a base Options with default values.
+// GetCommonOptions extracts standard [Options] from an Option list, merging
+// them onto base. If base is nil, a zero-value Options is used.
+//
+// Implementors must call this to honour options passed by callers:
+//
+//	func (m *MyModel) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+//	    options := model.GetCommonOptions(&model.Options{Temperature: &m.defaultTemp}, opts...)
+//	    // use options.Temperature, options.Tools, etc.
+//	}
 func GetCommonOptions(base *Options, opts ...Option) *Options {
 	if base == nil {
 		base = &Options{}
@@ -137,14 +223,19 @@ func GetCommonOptions(base *Options, opts ...Option) *Options {
 	return base
 }
 
-// GetImplSpecificOptions extract the implementation specific options from Option list, optionally providing a base options with default values.
-// e.g.
+// GetImplSpecificOptions extracts implementation-specific options from an
+// Option list, merging them onto base. If base is nil, a zero-value T is used.
 //
-//	myOption := &MyOption{
-//		Field1: "default_value",
+// Call this alongside [GetCommonOptions] to support both standard and custom
+// options in your implementation:
+//
+//	type MyOptions struct { MyParam string }
+//
+//	func (m *MyModel) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+//	    common  := model.GetCommonOptions(nil, opts...)
+//	    myOpts  := model.GetImplSpecificOptions(&MyOptions{MyParam: "default"}, opts...)
+//	    // use common.Temperature, myOpts.MyParam, etc.
 //	}
-//
-//	myOption := model.GetImplSpecificOptions(myOption, opts...)
 func GetImplSpecificOptions[T any](base *T, opts ...Option) *T {
 	if base == nil {
 		base = new(T)

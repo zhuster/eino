@@ -17,12 +17,15 @@
 package schema
 
 import (
+	"bytes"
+	"encoding/gob"
 	"encoding/json"
 	"testing"
 
 	"github.com/eino-contrib/jsonschema"
 	"github.com/smartystreets/goconvey/convey"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParamsOneOfToJSONSchema(t *testing.T) {
@@ -131,5 +134,102 @@ func TestParamsOneOfToJSONSchema(t *testing.T) {
 			assert.Equal(t, string(json1), string(json2))
 		})
 
+	})
+}
+
+func TestToolInfoSerialization(t *testing.T) {
+	ti1 := &ToolInfo{
+		ParamsOneOf: NewParamsOneOfByParams(map[string]*ParameterInfo{
+			"a": {
+				Type: String,
+				Desc: "desc",
+			},
+		}),
+	}
+	ti2 := &ToolInfo{
+		ParamsOneOf: NewParamsOneOfByJSONSchema(&jsonschema.Schema{
+			Type: "string",
+		}),
+	}
+
+	// json
+	b, err := json.Marshal(ti1)
+	assert.NoError(t, err)
+	result := &ToolInfo{}
+	err = json.Unmarshal(b, result)
+	assert.NoError(t, err)
+	assert.Equal(t, ti1, result)
+	b, err = json.Marshal(ti2)
+	assert.NoError(t, err)
+	result = &ToolInfo{}
+	err = json.Unmarshal(b, result)
+	assert.NoError(t, err)
+	assert.Equal(t, ti2, result)
+
+	// gob
+	buf := new(bytes.Buffer)
+	err = gob.NewEncoder(buf).Encode(ti1)
+	assert.NoError(t, err)
+	result = &ToolInfo{}
+	err = gob.NewDecoder(buf).Decode(result)
+	assert.NoError(t, err)
+	assert.Equal(t, ti1, result)
+	buf = new(bytes.Buffer)
+	err = gob.NewEncoder(buf).Encode(ti2)
+	assert.NoError(t, err)
+	result = &ToolInfo{}
+	err = gob.NewDecoder(buf).Decode(result)
+	assert.NoError(t, err)
+	assert.Equal(t, ti2, result)
+
+	// json roundtrip with empty-but-non-nil params map: must not collapse to nil,
+	// otherwise the params form is silently dropped.
+	tiEmpty := &ToolInfo{
+		ParamsOneOf: NewParamsOneOfByParams(map[string]*ParameterInfo{}),
+	}
+	b, err = json.Marshal(tiEmpty)
+	assert.NoError(t, err)
+	result = &ToolInfo{}
+	err = json.Unmarshal(b, result)
+	assert.NoError(t, err)
+	assert.NotNil(t, result.ParamsOneOf)
+	assert.NotNil(t, result.ParamsOneOf.params)
+	assert.Equal(t, tiEmpty, result)
+}
+
+func TestMCPToolResult_NilErrorCode(t *testing.T) {
+	result := &MCPToolResult{
+		CallID:  "test-call",
+		Name:    "test-tool",
+		Content: "some result",
+		Error: &MCPToolCallError{
+			Code:    nil,
+			Message: "something went wrong",
+		},
+	}
+
+	require.NotPanics(t, func() {
+		s := result.String()
+		t.Logf("String output: %s", s)
+		assert.Contains(t, s, "something went wrong")
+	}, "BUG: MCPToolResult.String() should not panic when Error.Code is nil")
+}
+
+func TestMCPToolResult_WithErrorCode(t *testing.T) {
+	code := int64(500)
+	result := &MCPToolResult{
+		CallID:  "test-call",
+		Name:    "test-tool",
+		Content: "",
+		Error: &MCPToolCallError{
+			Code:    &code,
+			Message: "internal server error",
+		},
+	}
+
+	require.NotPanics(t, func() {
+		s := result.String()
+		assert.Contains(t, s, "500")
+		assert.Contains(t, s, "internal server error")
 	})
 }

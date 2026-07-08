@@ -54,6 +54,19 @@ func (a *workflowAgent) Description(_ context.Context) string {
 	return a.description
 }
 
+func (a *workflowAgent) GetType() string {
+	switch a.mode {
+	case workflowAgentModeSequential:
+		return "Sequential"
+	case workflowAgentModeParallel:
+		return "Parallel"
+	case workflowAgentModeLoop:
+		return "Loop"
+	default:
+		return "WorkflowAgent"
+	}
+}
+
 func (a *workflowAgent) Run(ctx context.Context, _ *AgentInput, opts ...AgentRunOption) *AsyncIterator[*AgentEvent] {
 	iterator, generator := NewAsyncIteratorPair[*AgentEvent]()
 
@@ -144,7 +157,12 @@ func (a *workflowAgent) Resume(ctx context.Context, info *ResumeInfo, opts ...Ag
 	return iterator
 }
 
-// WorkflowInterruptInfo CheckpointSchema: persisted via InterruptInfo.Data (gob).
+// WorkflowInterruptInfo stores interrupt information for workflow agents.
+// CheckpointSchema: persisted via InterruptInfo.Data (gob).
+//
+// NOT RECOMMENDED: Workflow agents are built on agent transfer with full context sharing,
+// which has not proven to be more effective empirically. Consider using
+// ChatModelAgent with AgentTool or DeepAgent instead for most multi-agent scenarios.
 type WorkflowInterruptInfo struct {
 	OrigInput *AgentInput
 
@@ -162,7 +180,6 @@ func (a *workflowAgent) runSequential(ctx context.Context,
 
 	startIdx := 0
 
-	// seqCtx tracks the accumulated RunPath across the sequence.
 	seqCtx := ctx
 
 	// If we are resuming, find which sub-agent to start from and prepare its context.
@@ -180,12 +197,28 @@ func (a *workflowAgent) runSequential(ctx context.Context,
 	for i := startIdx; i < len(a.subAgents); i++ {
 		subAgent := a.subAgents[i]
 
+		// Cancel check at transition boundary between sub-agents.
+		// Transition boundaries are always safe to cancel at — no sub-agent
+		// work is in progress, so any cancel mode is honoured.
+		if cancelCtx := getCancelContext(ctx); cancelCtx != nil && cancelCtx.shouldCancel() {
+			state := &sequentialWorkflowState{InterruptIndex: i}
+			event := cancelAtTransition(ctx, "Sequential workflow cancel at transition", state)
+			generator.Send(event)
+			return nil
+		}
+
 		var subIterator *AsyncIterator[*AgentEvent]
 		if seqState != nil {
-			subIterator = subAgent.Resume(seqCtx, &ResumeInfo{
-				EnableStreaming: info.EnableStreaming,
-				InterruptInfo:   info.Data.(*WorkflowInterruptInfo).SequentialInterruptInfo,
-			}, opts...)
+			wfInfo, _ := info.Data.(*WorkflowInterruptInfo)
+			if wfInfo != nil && wfInfo.SequentialInterruptInfo != nil {
+				// Sub-agent was interrupted — resume it.
+				subIterator = subAgent.Resume(seqCtx, &ResumeInfo{
+					EnableStreaming: info.EnableStreaming,
+					InterruptInfo:   wfInfo.SequentialInterruptInfo,
+				}, opts...)
+			} else {
+				subIterator = subAgent.Run(seqCtx, nil, opts...)
+			}
 			seqState = nil
 		} else {
 			subIterator = subAgent.Run(seqCtx, nil, opts...)
@@ -275,23 +308,14 @@ type BreakLoopAction struct {
 
 // NewBreakLoopAction creates a new BreakLoopAction, signaling a request
 // to terminate the current loop.
+//
+// NOT RECOMMENDED: Workflow agents are built on agent transfer with full context sharing,
+// which has not proven to be more effective empirically. Consider using
+// ChatModelAgent with AgentTool or DeepAgent instead for most multi-agent scenarios.
 func NewBreakLoopAction(agentName string) *AgentAction {
 	return &AgentAction{BreakLoop: &BreakLoopAction{
 		From: agentName,
 	}}
-}
-
-func (a *workflowAgent) doBreakLoopIfNeeded(aa *AgentAction, iterations int) bool {
-	if a.mode != workflowAgentModeLoop {
-		return false
-	}
-
-	if aa != nil && aa.BreakLoop != nil && !aa.BreakLoop.Done {
-		aa.BreakLoop.Done = true
-		aa.BreakLoop.CurrentIterations = iterations
-		return true
-	}
-	return false
 }
 
 func (a *workflowAgent) runLoop(ctx context.Context, generator *AsyncGenerator[*AgentEvent],
@@ -304,7 +328,6 @@ func (a *workflowAgent) runLoop(ctx context.Context, generator *AsyncGenerator[*
 	startIter := 0
 	startIdx := 0
 
-	// loopCtx tracks the accumulated RunPath across the full sequence within a single iteration.
 	loopCtx := ctx
 
 	if loopState != nil {
@@ -329,13 +352,25 @@ func (a *workflowAgent) runLoop(ctx context.Context, generator *AsyncGenerator[*
 		for j := startIdx; j < len(a.subAgents); j++ {
 			subAgent := a.subAgents[j]
 
+			if cancelCtx := getCancelContext(ctx); cancelCtx != nil && cancelCtx.shouldCancel() {
+				state := &loopWorkflowState{LoopIterations: i, SubAgentIndex: j}
+				event := cancelAtTransition(ctx, "Loop workflow cancel at transition", state)
+				generator.Send(event)
+				return nil
+			}
+
 			var subIterator *AsyncIterator[*AgentEvent]
 			if loopState != nil {
-				// This is the agent we need to resume.
-				subIterator = subAgent.Resume(loopCtx, &ResumeInfo{
-					EnableStreaming: resumeInfo.EnableStreaming,
-					InterruptInfo:   resumeInfo.Data.(*WorkflowInterruptInfo).SequentialInterruptInfo,
-				}, opts...)
+				wfInfo, _ := resumeInfo.Data.(*WorkflowInterruptInfo)
+				if wfInfo != nil && wfInfo.SequentialInterruptInfo != nil {
+					// Sub-agent was interrupted — resume it.
+					subIterator = subAgent.Resume(loopCtx, &ResumeInfo{
+						EnableStreaming: resumeInfo.EnableStreaming,
+						InterruptInfo:   wfInfo.SequentialInterruptInfo,
+					}, opts...)
+				} else {
+					subIterator = subAgent.Run(loopCtx, nil, opts...)
+				}
 				loopState = nil // Only resume the first time.
 			} else {
 				subIterator = subAgent.Run(loopCtx, nil, opts...)
@@ -344,13 +379,24 @@ func (a *workflowAgent) runLoop(ctx context.Context, generator *AsyncGenerator[*
 			loopCtx = updateRunPathOnly(loopCtx, subAgent.Name(loopCtx))
 
 			var lastActionEvent *AgentEvent
+			var breakLoopEvent *AgentEvent
 			for {
 				event, ok := subIterator.Next()
 				if !ok {
 					break
 				}
 
+				if event.Err != nil {
+					generator.Send(event)
+					return nil
+				}
+
 				if lastActionEvent != nil {
+					if lastActionEvent.Action.BreakLoop != nil && !lastActionEvent.Action.BreakLoop.Done {
+						lastActionEvent.Action.BreakLoop.Done = true
+						lastActionEvent.Action.BreakLoop.CurrentIterations = i
+						breakLoopEvent = lastActionEvent
+					}
 					generator.Send(lastActionEvent)
 					lastActionEvent = nil
 				}
@@ -363,6 +409,12 @@ func (a *workflowAgent) runLoop(ctx context.Context, generator *AsyncGenerator[*
 			}
 
 			if lastActionEvent != nil {
+				if lastActionEvent.Action.BreakLoop != nil && !lastActionEvent.Action.BreakLoop.Done {
+					lastActionEvent.Action.BreakLoop.Done = true
+					lastActionEvent.Action.BreakLoop.CurrentIterations = i
+					breakLoopEvent = lastActionEvent
+				}
+
 				if lastActionEvent.Action.internalInterrupted != nil {
 					// A sub-agent interrupted. Wrap it with our own loop state.
 					state := &loopWorkflowState{
@@ -392,12 +444,11 @@ func (a *workflowAgent) runLoop(ctx context.Context, generator *AsyncGenerator[*
 					return
 				}
 
-				if a.doBreakLoopIfNeeded(lastActionEvent.Action, i) {
-					generator.Send(lastActionEvent)
-					return
-				}
-
 				generator.Send(lastActionEvent)
+			}
+
+			if breakLoopEvent != nil {
+				return
 			}
 		}
 
@@ -452,6 +503,15 @@ func (a *workflowAgent) runParallel(ctx context.Context, generator *AsyncGenerat
 		}
 	}
 
+	// Cancel check before spawning parallel goroutines. No sub-agent work
+	// is in progress, so any cancel mode is honoured at this boundary.
+	if cancelCtx := getCancelContext(ctx); cancelCtx != nil && cancelCtx.shouldCancel() {
+		state := &parallelWorkflowState{}
+		event := cancelAtTransition(ctx, "Parallel workflow cancel before spawn", state)
+		generator.Send(event)
+		return nil
+	}
+
 	for i := range a.subAgents {
 		wg.Add(1)
 		go func(idx int, agent *flowAgent) {
@@ -467,11 +527,13 @@ func (a *workflowAgent) runParallel(ctx context.Context, generator *AsyncGenerat
 			var iterator *AsyncIterator[*AgentEvent]
 
 			if _, ok := agentNames[agent.Name(ctx)]; ok {
-				// This branch was interrupted and needs to be resumed.
-				iterator = agent.Resume(childContexts[idx], &ResumeInfo{
+				childResumeInfo := &ResumeInfo{
 					EnableStreaming: resumeInfo.EnableStreaming,
-					InterruptInfo:   resumeInfo.Data.(*WorkflowInterruptInfo).ParallelInterruptInfo[idx],
-				}, opts...)
+				}
+				if wfInfo, ok := resumeInfo.Data.(*WorkflowInterruptInfo); ok && wfInfo != nil {
+					childResumeInfo.InterruptInfo = wfInfo.ParallelInterruptInfo[idx]
+				}
+				iterator = agent.Resume(childContexts[idx], childResumeInfo, opts...)
 			} else if parState != nil {
 				// We are resuming, but this child is not in the next points map.
 				// This means it finished successfully, so we don't run it.
@@ -534,18 +596,54 @@ func (a *workflowAgent) runParallel(ctx context.Context, generator *AsyncGenerat
 	return nil
 }
 
+func cancelAtTransition(ctx context.Context, info string, state any) *AgentEvent {
+	// state is the workflow checkpoint state (e.g. sequentialWorkflowState);
+	// nil for subContexts because this is a leaf interrupt with no child signals.
+	is, err := core.Interrupt(ctx, info, state, nil,
+		core.WithLayerPayload(getRunCtx(ctx).RunPath))
+	if err != nil {
+		return &AgentEvent{Err: err}
+	}
+
+	contexts := core.ToInterruptContexts(is, allowedAddressSegmentTypes)
+
+	return &AgentEvent{
+		Action: &AgentAction{
+			Interrupted: &InterruptInfo{
+				InterruptContexts: contexts,
+			},
+			internalInterrupted: is,
+		},
+	}
+}
+
+// SequentialAgentConfig is the configuration for NewSequentialAgent.
+//
+// NOT RECOMMENDED: Workflow agents are built on agent transfer with full context sharing,
+// which has not proven to be more effective empirically. Consider using
+// ChatModelAgent with AgentTool or DeepAgent instead for most multi-agent scenarios.
 type SequentialAgentConfig struct {
 	Name        string
 	Description string
 	SubAgents   []Agent
 }
 
+// ParallelAgentConfig is the configuration for NewParallelAgent.
+//
+// NOT RECOMMENDED: Workflow agents are built on agent transfer with full context sharing,
+// which has not proven to be more effective empirically. Consider using
+// ChatModelAgent with AgentTool or DeepAgent instead for most multi-agent scenarios.
 type ParallelAgentConfig struct {
 	Name        string
 	Description string
 	SubAgents   []Agent
 }
 
+// LoopAgentConfig is the configuration for NewLoopAgent.
+//
+// NOT RECOMMENDED: Workflow agents are built on agent transfer with full context sharing,
+// which has not proven to be more effective empirically. Consider using
+// ChatModelAgent with AgentTool or DeepAgent instead for most multi-agent scenarios.
 type LoopAgentConfig struct {
 	Name        string
 	Description string
@@ -581,16 +679,28 @@ func newWorkflowAgent(ctx context.Context, name, desc string,
 }
 
 // NewSequentialAgent creates an agent that runs sub-agents sequentially.
+//
+// NOT RECOMMENDED: Workflow agents are built on agent transfer with full context sharing,
+// which has not proven to be more effective empirically. Consider using
+// ChatModelAgent with AgentTool or DeepAgent instead for most multi-agent scenarios.
 func NewSequentialAgent(ctx context.Context, config *SequentialAgentConfig) (ResumableAgent, error) {
 	return newWorkflowAgent(ctx, config.Name, config.Description, config.SubAgents, workflowAgentModeSequential, 0)
 }
 
 // NewParallelAgent creates an agent that runs sub-agents in parallel.
+//
+// NOT RECOMMENDED: Workflow agents are built on agent transfer with full context sharing,
+// which has not proven to be more effective empirically. Consider using
+// ChatModelAgent with AgentTool or DeepAgent instead for most multi-agent scenarios.
 func NewParallelAgent(ctx context.Context, config *ParallelAgentConfig) (ResumableAgent, error) {
 	return newWorkflowAgent(ctx, config.Name, config.Description, config.SubAgents, workflowAgentModeParallel, 0)
 }
 
 // NewLoopAgent creates an agent that loops over sub-agents with a max iteration limit.
+//
+// NOT RECOMMENDED: Workflow agents are built on agent transfer with full context sharing,
+// which has not proven to be more effective empirically. Consider using
+// ChatModelAgent with AgentTool or DeepAgent instead for most multi-agent scenarios.
 func NewLoopAgent(ctx context.Context, config *LoopAgentConfig) (ResumableAgent, error) {
 	return newWorkflowAgent(ctx, config.Name, config.Description, config.SubAgents, workflowAgentModeLoop, config.MaxIterations)
 }

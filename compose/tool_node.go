@@ -18,10 +18,15 @@ package compose
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"sort"
+	"strings"
 	"sync"
+
+	"github.com/bytedance/sonic"
 
 	"github.com/cloudwego/eino/callbacks"
 	"github.com/cloudwego/eino/components"
@@ -33,6 +38,8 @@ import (
 type toolsNodeOptions struct {
 	ToolOptions []tool.Option
 	ToolList    []tool.BaseTool
+
+	ToolAliases map[string]ToolAliasConfig
 }
 
 // ToolsNodeOption is the option func type for ToolsNode.
@@ -52,6 +59,15 @@ func WithToolList(tool ...tool.BaseTool) ToolsNodeOption {
 	}
 }
 
+// WithToolAliases sets the tool aliases for the ToolsNode call option.
+// When used with WithToolList, it overrides the global alias configuration for the dynamic tool list.
+// When used alone (without WithToolList), it replaces the global alias configuration while keeping the original tool list.
+func WithToolAliases(toolAliases map[string]ToolAliasConfig) ToolsNodeOption {
+	return func(o *toolsNodeOptions) {
+		o.ToolAliases = toolAliases
+	}
+}
+
 // ToolsNode represents a node capable of executing tools within a graph.
 // The Graph Node interface is defined as follows:
 //
@@ -61,12 +77,16 @@ func WithToolList(tool ...tool.BaseTool) ToolsNodeOption {
 // Input: An AssistantMessage containing ToolCalls
 // Output: An array of ToolMessage where the order of elements corresponds to the order of ToolCalls in the input
 type ToolsNode struct {
-	tuple                     *toolsTuple
-	unknownToolHandler        func(ctx context.Context, name, input string) (string, error)
-	executeSequentially       bool
-	toolArgumentsHandler      func(ctx context.Context, name, input string) (string, error)
-	toolCallMiddlewares       []InvokableToolMiddleware
-	streamToolCallMiddlewares []StreamableToolMiddleware
+	tuple                             *toolsTuple
+	tools                             []tool.BaseTool
+	unknownToolHandler                func(ctx context.Context, name, input string) (string, error)
+	executeSequentially               bool
+	toolArgumentsHandler              func(ctx context.Context, name, input string) (string, error)
+	toolCallMiddlewares               []InvokableToolMiddleware
+	streamToolCallMiddlewares         []StreamableToolMiddleware
+	enhancedToolCallMiddlewares       []EnhancedInvokableToolMiddleware
+	enhancedStreamToolCallMiddlewares []EnhancedStreamableToolMiddleware
+	toolAliasConfigs                  map[string]ToolAliasConfig
 }
 
 // ToolInput represents the input parameters for a tool call execution.
@@ -93,11 +113,29 @@ type StreamToolOutput struct {
 	Result *schema.StreamReader[string]
 }
 
+// EnhancedInvokableToolOutput represents the result of a non-streaming enhanced tool call execution.
+// It supports returning structured multimodal content (text, images, audio, video, files) from tools.
+type EnhancedInvokableToolOutput struct {
+	// Result contains the structured multimodal output from the tool execution.
+	Result *schema.ToolResult
+}
+
+// EnhancedStreamableToolOutput represents the result of a streaming enhanced tool call execution.
+// It provides a stream reader for accessing multimodal content progressively.
+type EnhancedStreamableToolOutput struct {
+	// Result is a stream reader that provides access to the tool's streaming multimodal output.
+	Result *schema.StreamReader[*schema.ToolResult]
+}
+
 // InvokableToolEndpoint is the function signature for non-streaming tool calls.
 type InvokableToolEndpoint func(ctx context.Context, input *ToolInput) (*ToolOutput, error)
 
 // StreamableToolEndpoint is the function signature for streaming tool calls.
 type StreamableToolEndpoint func(ctx context.Context, input *ToolInput) (*StreamToolOutput, error)
+
+type EnhancedInvokableToolEndpoint func(ctx context.Context, input *ToolInput) (*EnhancedInvokableToolOutput, error)
+
+type EnhancedStreamableToolEndpoint func(ctx context.Context, input *ToolInput) (*EnhancedStreamableToolOutput, error)
 
 // InvokableToolMiddleware is a function that wraps InvokableToolEndpoint to add custom processing logic.
 // It can be used to intercept, modify, or enhance tool call execution for non-streaming tools.
@@ -106,6 +144,10 @@ type InvokableToolMiddleware func(InvokableToolEndpoint) InvokableToolEndpoint
 // StreamableToolMiddleware is a function that wraps StreamableToolEndpoint to add custom processing logic.
 // It can be used to intercept, modify, or enhance tool call execution for streaming tools.
 type StreamableToolMiddleware func(StreamableToolEndpoint) StreamableToolEndpoint
+
+type EnhancedInvokableToolMiddleware func(EnhancedInvokableToolEndpoint) EnhancedInvokableToolEndpoint
+
+type EnhancedStreamableToolMiddleware func(EnhancedStreamableToolEndpoint) EnhancedStreamableToolEndpoint
 
 // ToolMiddleware groups middleware hooks for invokable and streamable tool calls.
 type ToolMiddleware struct {
@@ -116,12 +158,39 @@ type ToolMiddleware struct {
 	// Streamable contains middleware function for streaming tool calls.
 	// Note: This middleware only applies to tools that implement the StreamableTool interface.
 	Streamable StreamableToolMiddleware
+
+	// EnhancedInvokable contains middleware function for non-streaming enhanced tool calls.
+	// Note: This middleware only applies to tools that implement the EnhancedInvokableTool interface.
+	EnhancedInvokable EnhancedInvokableToolMiddleware
+
+	// EnhancedStreamable contains middleware function for streaming enhanced tool calls.
+	// Note: This middleware only applies to tools that implement the EnhancedStreamableTool interface.
+	EnhancedStreamable EnhancedStreamableToolMiddleware
+}
+
+// ToolAliasConfig configures name and argument aliases for a single tool.
+type ToolAliasConfig struct {
+	// NameAliases are alternative names for this tool.
+	// If the model returns any of these names, it will be resolved to the canonical tool name.
+	NameAliases []string
+
+	// ArgumentsAliases maps canonical argument keys to their alias lists.
+	// key=canonical, value=[]alias. Applied to top-level JSON keys before tool execution.
+	// Example: {"query": ["q", "search_term"], "limit": ["max_results", "count"]}
+	ArgumentsAliases map[string][]string
 }
 
 // ToolsNodeConfig is the config for ToolsNode.
 type ToolsNodeConfig struct {
 	// Tools specify the list of tools can be called which are BaseTool but must implement InvokableTool or StreamableTool.
 	Tools []tool.BaseTool
+
+	// ToolAliases configures name and argument aliases for tools.
+	// Key is the canonical tool name, value defines its aliases.
+	// This field is optional. When provided, tool name aliases will be resolved during tool dispatch,
+	// and argument aliases will be remapped before ToolArgumentsHandler (if configured) and tool execution.
+	// Execution order: ArgumentsAliases remapping → ToolArgumentsHandler → tool execution
+	ToolAliases map[string]ToolAliasConfig
 
 	// UnknownToolsHandler handles tool calls for non-existent tools when LLM hallucinates.
 	// This field is optional. When not set, calling a non-existent tool will result in an error.
@@ -169,6 +238,9 @@ type ToolsNodeConfig struct {
 func NewToolNode(ctx context.Context, conf *ToolsNodeConfig) (*ToolsNode, error) {
 	var middlewares []InvokableToolMiddleware
 	var streamMiddlewares []StreamableToolMiddleware
+	var enhancedInvokableMiddlewares []EnhancedInvokableToolMiddleware
+	var enhancedStreamableMiddlewares []EnhancedStreamableToolMiddleware
+
 	for _, m := range conf.ToolCallMiddlewares {
 		if m.Invokable != nil {
 			middlewares = append(middlewares, m.Invokable)
@@ -176,28 +248,56 @@ func NewToolNode(ctx context.Context, conf *ToolsNodeConfig) (*ToolsNode, error)
 		if m.Streamable != nil {
 			streamMiddlewares = append(streamMiddlewares, m.Streamable)
 		}
+		if m.EnhancedInvokable != nil {
+			enhancedInvokableMiddlewares = append(enhancedInvokableMiddlewares, m.EnhancedInvokable)
+		}
+		if m.EnhancedStreamable != nil {
+			enhancedStreamableMiddlewares = append(enhancedStreamableMiddlewares, m.EnhancedStreamable)
+		}
 	}
 
-	tuple, err := convTools(ctx, conf.Tools, middlewares, streamMiddlewares)
+	params := convToolsParams{
+		tools:        conf.Tools,
+		aliasConfigs: conf.ToolAliases,
+	}
+	params.middlewares.invokable = middlewares
+	params.middlewares.streamable = streamMiddlewares
+	params.middlewares.enhancedInvokable = enhancedInvokableMiddlewares
+	params.middlewares.enhancedStreamable = enhancedStreamableMiddlewares
+	tuple, err := convTools(ctx, params)
 	if err != nil {
 		return nil, err
 	}
 
 	return &ToolsNode{
-		tuple:                     tuple,
-		unknownToolHandler:        conf.UnknownToolsHandler,
-		executeSequentially:       conf.ExecuteSequentially,
-		toolArgumentsHandler:      conf.ToolArgumentsHandler,
-		toolCallMiddlewares:       middlewares,
-		streamToolCallMiddlewares: streamMiddlewares,
+		tuple:                             tuple,
+		tools:                             conf.Tools,
+		unknownToolHandler:                conf.UnknownToolsHandler,
+		executeSequentially:               conf.ExecuteSequentially,
+		toolArgumentsHandler:              conf.ToolArgumentsHandler,
+		toolCallMiddlewares:               middlewares,
+		streamToolCallMiddlewares:         streamMiddlewares,
+		enhancedToolCallMiddlewares:       enhancedInvokableMiddlewares,
+		enhancedStreamToolCallMiddlewares: enhancedStreamableMiddlewares,
+		toolAliasConfigs:                  conf.ToolAliases,
 	}, nil
 }
 
 // ToolsInterruptAndRerunExtra carries interrupt metadata for ToolsNode reruns.
 type ToolsInterruptAndRerunExtra struct {
-	ToolCalls     []schema.ToolCall
+	// ToolCalls contains all tool calls from the original assistant message.
+	ToolCalls []schema.ToolCall
+
+	// ExecutedTools maps tool call IDs to their string output for successfully executed standard tools.
 	ExecutedTools map[string]string
-	RerunTools    []string
+
+	// ExecutedEnhancedTools maps tool call IDs to their structured multimodal output for successfully executed enhanced tools.
+	ExecutedEnhancedTools map[string]*schema.ToolResult
+
+	// RerunTools contains the IDs of tool calls that need to be re-executed.
+	RerunTools []string
+
+	// RerunExtraMap stores additional metadata for each tool call that needs rerun, keyed by tool call ID.
 	RerunExtraMap map[string]any
 }
 
@@ -207,26 +307,197 @@ func init() {
 }
 
 type toolsInterruptAndRerunState struct {
-	Input         *schema.Message
-	ExecutedTools map[string]string
-	RerunTools    []string
+	Input                 *schema.Message
+	ExecutedTools         map[string]string
+	ExecutedEnhancedTools map[string]*schema.ToolResult
+	RerunTools            []string
 }
 
 type toolsTuple struct {
-	indexes         map[string]int
-	meta            []*executorMeta
-	endpoints       []InvokableToolEndpoint
-	streamEndpoints []StreamableToolEndpoint
+	indexes                     map[string]int
+	meta                        []*executorMeta
+	endpoints                   []InvokableToolEndpoint
+	streamEndpoints             []StreamableToolEndpoint
+	enhancedInvokableEndpoints  []EnhancedInvokableToolEndpoint
+	enhancedStreamableEndpoints []EnhancedStreamableToolEndpoint
+	// argsAliasMap stores reverse argument alias mappings for each tool.
+	// key: canonical tool name, value: map[aliasKey]canonicalKey (alias → canonical direction)
+	argsAliasMap map[string]map[string]string
+	// canonicalNames stores the canonical name for each tool index
+	canonicalNames []string
+	// toolInfos stores the ToolInfo for each tool index, used for alias validation
+	toolInfos []*schema.ToolInfo
 }
 
-func convTools(ctx context.Context, tools []tool.BaseTool, ms []InvokableToolMiddleware, sms []StreamableToolMiddleware) (*toolsTuple, error) {
-	ret := &toolsTuple{
-		indexes:         make(map[string]int),
-		meta:            make([]*executorMeta, len(tools)),
-		endpoints:       make([]InvokableToolEndpoint, len(tools)),
-		streamEndpoints: make([]StreamableToolEndpoint, len(tools)),
+// remapArgs replaces alias keys in the JSON arguments string with canonical keys.
+// aliasMap: alias → canonical mapping
+func remapArgs(args string, aliasMap map[string]string) (string, error) {
+	if len(aliasMap) == 0 {
+		return args, nil
 	}
-	for idx, bt := range tools {
+
+	trimmed := strings.TrimSpace(args)
+	if trimmed == "" || trimmed[0] != '{' {
+		return args, nil
+	}
+
+	var m map[string]json.RawMessage
+	if err := sonic.Unmarshal([]byte(args), &m); err != nil {
+		return args, nil
+	}
+
+	changed := false
+	for alias, canonical := range aliasMap {
+		if v, ok := m[alias]; ok {
+			// Only replace if canonical key doesn't exist.
+			// If both alias and canonical are present (e.g. {"q":"a","query":"b"}),
+			// the alias key is kept as-is and passed through as an unknown field.
+			if _, exists := m[canonical]; !exists {
+				m[canonical] = v
+				delete(m, alias)
+				changed = true
+			}
+		}
+	}
+
+	if !changed {
+		return args, nil
+	}
+
+	b, err := sonic.Marshal(m)
+	return string(b), err
+}
+
+type convToolsParams struct {
+	tools       []tool.BaseTool
+	middlewares struct {
+		invokable          []InvokableToolMiddleware
+		streamable         []StreamableToolMiddleware
+		enhancedInvokable  []EnhancedInvokableToolMiddleware
+		enhancedStreamable []EnhancedStreamableToolMiddleware
+	}
+	aliasConfigs map[string]ToolAliasConfig
+}
+
+func (t *toolsTuple) applyAliasConfigs(aliasConfigs map[string]ToolAliasConfig) error {
+	t.argsAliasMap = make(map[string]map[string]string)
+
+	sortedToolNames := make([]string, 0, len(aliasConfigs))
+	for toolName := range aliasConfigs {
+		sortedToolNames = append(sortedToolNames, toolName)
+	}
+	sort.Strings(sortedToolNames)
+
+	for _, toolName := range sortedToolNames {
+		aliasConfig := aliasConfigs[toolName]
+		var (
+			toolIdx int
+			exists  bool
+		)
+		if toolIdx, exists = t.indexes[toolName]; !exists {
+			continue
+		}
+
+		if err := t.applyNameAliases(toolName, toolIdx, aliasConfig.NameAliases); err != nil {
+			return err
+		}
+
+		if err := t.applyArgsAliases(toolName, toolIdx, aliasConfig.ArgumentsAliases); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// applyNameAliases validates and registers name aliases for a single tool into the indexes map.
+func (t *toolsTuple) applyNameAliases(toolName string, toolIdx int, nameAliases []string) error {
+	for _, alias := range nameAliases {
+		if strings.TrimSpace(alias) == "" {
+			return fmt.Errorf("tool '%s' has empty name alias", toolName)
+		}
+		if existingIdx, conflict := t.indexes[alias]; conflict {
+			if existingIdx != toolIdx {
+				conflictToolName := t.canonicalNames[existingIdx]
+				if alias == conflictToolName {
+					return fmt.Errorf("tool '%s': name alias '%s' conflicts with existing tool's canonical name", toolName, alias)
+				}
+				return fmt.Errorf("tool '%s': name alias '%s' conflicts with an alias already registered for tool '%s'", toolName, alias, conflictToolName)
+			}
+			continue
+		}
+		t.indexes[alias] = toolIdx
+	}
+	return nil
+}
+
+// applyArgsAliases validates argument aliases against the tool schema and builds a reverse alias map for a single tool.
+func (t *toolsTuple) applyArgsAliases(toolName string, toolIdx int, argumentsAliases map[string][]string) error {
+	if len(argumentsAliases) == 0 {
+		return nil
+	}
+
+	schemaKeys := make(map[string]bool)
+	if info := t.toolInfos[toolIdx]; info != nil && info.ParamsOneOf != nil {
+		js, err := info.ParamsOneOf.ToJSONSchema()
+		if err != nil {
+			return fmt.Errorf("tool '%s': failed to parse JSON schema for alias validation: %w", toolName, err)
+		}
+		if js != nil && js.Properties != nil {
+			for pair := js.Properties.Oldest(); pair != nil; pair = pair.Next() {
+				schemaKeys[pair.Key] = true
+			}
+		}
+	}
+
+	reverseMap := make(map[string]string)
+	sortedCanonicals := make([]string, 0, len(argumentsAliases))
+	for canonical := range argumentsAliases {
+		sortedCanonicals = append(sortedCanonicals, canonical)
+	}
+	sort.Strings(sortedCanonicals)
+
+	for _, canonical := range sortedCanonicals {
+		aliases := argumentsAliases[canonical]
+		if strings.TrimSpace(canonical) == "" {
+			return fmt.Errorf("tool '%s' has empty canonical argument key", toolName)
+		}
+		if strings.Contains(canonical, ".") {
+			return fmt.Errorf("tool '%s' has unsupported '.' in canonical argument key '%s': nested field matching is not yet supported",
+				toolName, canonical)
+		}
+		for _, alias := range aliases {
+			if strings.TrimSpace(alias) == "" {
+				return fmt.Errorf("tool '%s' has empty argument alias for canonical key '%s'", toolName, canonical)
+			}
+			if schemaKeys[alias] {
+				return fmt.Errorf("tool '%s' has arg alias '%s' that conflicts with existing schema property '%s'",
+					toolName, alias, alias)
+			}
+			if existingCanonical, conflict := reverseMap[alias]; conflict {
+				return fmt.Errorf("tool '%s' has conflicting arg alias '%s' mapped to both '%s' and '%s'",
+					toolName, alias, existingCanonical, canonical)
+			}
+			reverseMap[alias] = canonical
+		}
+	}
+	t.argsAliasMap[toolName] = reverseMap
+
+	return nil
+}
+
+func convTools(ctx context.Context, params convToolsParams) (*toolsTuple, error) {
+	ret := &toolsTuple{
+		indexes:                     make(map[string]int),
+		meta:                        make([]*executorMeta, len(params.tools)),
+		endpoints:                   make([]InvokableToolEndpoint, len(params.tools)),
+		streamEndpoints:             make([]StreamableToolEndpoint, len(params.tools)),
+		enhancedInvokableEndpoints:  make([]EnhancedInvokableToolEndpoint, len(params.tools)),
+		enhancedStreamableEndpoints: make([]EnhancedStreamableToolEndpoint, len(params.tools)),
+		canonicalNames:              make([]string, len(params.tools)),
+		toolInfos:                   make([]*schema.ToolInfo, len(params.tools)),
+	}
+	for idx, bt := range params.tools {
 		tl, err := bt.Info(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("(NewToolNode) failed to get tool info at idx= %d: %w", idx, err)
@@ -234,11 +505,15 @@ func convTools(ctx context.Context, tools []tool.BaseTool, ms []InvokableToolMid
 
 		toolName := tl.Name
 		var (
-			st tool.StreamableTool
-			it tool.InvokableTool
+			st     tool.StreamableTool
+			it     tool.InvokableTool
+			eiTool tool.EnhancedInvokableTool
+			esTool tool.EnhancedStreamableTool
 
-			invokable  InvokableToolEndpoint
-			streamable StreamableToolEndpoint
+			invokable          InvokableToolEndpoint
+			streamable         StreamableToolEndpoint
+			enhancedInvokable  EnhancedInvokableToolEndpoint
+			enhancedStreamable EnhancedStreamableToolEndpoint
 
 			ok   bool
 			meta *executorMeta
@@ -247,29 +522,54 @@ func convTools(ctx context.Context, tools []tool.BaseTool, ms []InvokableToolMid
 		meta = parseExecutorInfoFromComponent(components.ComponentOfTool, bt)
 
 		if st, ok = bt.(tool.StreamableTool); ok {
-			streamable = wrapStreamToolCall(st, sms, !meta.isComponentCallbackEnabled)
+			streamable = wrapStreamToolCall(st, params.middlewares.streamable, !meta.isComponentCallbackEnabled)
 		}
 
 		if it, ok = bt.(tool.InvokableTool); ok {
-			invokable = wrapToolCall(it, ms, !meta.isComponentCallbackEnabled)
+			invokable = wrapToolCall(it, params.middlewares.invokable, !meta.isComponentCallbackEnabled)
 		}
 
-		if st == nil && it == nil {
-			return nil, fmt.Errorf("tool %s is not invokable or streamable", toolName)
+		if eiTool, ok = bt.(tool.EnhancedInvokableTool); ok {
+			enhancedInvokable = wrapEnhancedInvokableToolCall(eiTool, params.middlewares.enhancedInvokable, !meta.isComponentCallbackEnabled)
 		}
 
-		if streamable == nil {
+		if esTool, ok = bt.(tool.EnhancedStreamableTool); ok {
+			enhancedStreamable = wrapEnhancedStreamableToolCall(esTool, params.middlewares.enhancedStreamable, !meta.isComponentCallbackEnabled)
+		}
+
+		if st == nil && it == nil && eiTool == nil && esTool == nil {
+			return nil, fmt.Errorf("tool %s is not invokable, streamable, enhanced invokable or enhanced streamable", toolName)
+		}
+		if streamable == nil && invokable != nil {
 			streamable = invokableToStreamable(invokable)
 		}
-		if invokable == nil {
+		if invokable == nil && streamable != nil {
 			invokable = streamableToInvokable(streamable)
+		}
+
+		if enhancedStreamable == nil && enhancedInvokable != nil {
+			enhancedStreamable = enhancedInvokableToEnhancedStreamable(enhancedInvokable)
+		}
+		if enhancedInvokable == nil && enhancedStreamable != nil {
+			enhancedInvokable = enhancedStreamableToEnhancedInvokable(enhancedStreamable)
 		}
 
 		ret.indexes[toolName] = idx
 		ret.meta[idx] = meta
 		ret.endpoints[idx] = invokable
 		ret.streamEndpoints[idx] = streamable
+		ret.enhancedInvokableEndpoints[idx] = enhancedInvokable
+		ret.enhancedStreamableEndpoints[idx] = enhancedStreamable
+		ret.canonicalNames[idx] = toolName
+		ret.toolInfos[idx] = tl
 	}
+
+	if len(params.aliasConfigs) > 0 {
+		if err := ret.applyAliasConfigs(params.aliasConfigs); err != nil {
+			return nil, err
+		}
+	}
+
 	return ret, nil
 }
 
@@ -311,6 +611,44 @@ func wrapStreamToolCall(st tool.StreamableTool, middlewares []StreamableToolMidd
 	})
 }
 
+func wrapEnhancedInvokableToolCall(eiTool tool.EnhancedInvokableTool, middlewares []EnhancedInvokableToolMiddleware, needCallback bool) EnhancedInvokableToolEndpoint {
+	middleware := func(next EnhancedInvokableToolEndpoint) EnhancedInvokableToolEndpoint {
+		for i := len(middlewares) - 1; i >= 0; i-- {
+			next = middlewares[i](next)
+		}
+		return next
+	}
+	if needCallback {
+		eiTool = &enhancedInvokableToolWithCallback{eiTool: eiTool}
+	}
+	return middleware(func(ctx context.Context, input *ToolInput) (*EnhancedInvokableToolOutput, error) {
+		result, err := eiTool.InvokableRun(ctx, &schema.ToolArgument{Text: input.Arguments}, input.CallOptions...)
+		if err != nil {
+			return nil, err
+		}
+		return &EnhancedInvokableToolOutput{Result: result}, nil
+	})
+}
+
+func wrapEnhancedStreamableToolCall(est tool.EnhancedStreamableTool, middlewares []EnhancedStreamableToolMiddleware, needCallback bool) EnhancedStreamableToolEndpoint {
+	middleware := func(next EnhancedStreamableToolEndpoint) EnhancedStreamableToolEndpoint {
+		for i := len(middlewares) - 1; i >= 0; i-- {
+			next = middlewares[i](next)
+		}
+		return next
+	}
+	if needCallback {
+		est = &enhancedStreamableToolWithCallback{est: est}
+	}
+	return middleware(func(ctx context.Context, input *ToolInput) (*EnhancedStreamableToolOutput, error) {
+		result, err := est.StreamableRun(ctx, &schema.ToolArgument{Text: input.Arguments}, input.CallOptions...)
+		if err != nil {
+			return nil, err
+		}
+		return &EnhancedStreamableToolOutput{Result: result}, nil
+	})
+}
+
 type invokableToolWithCallback struct {
 	it tool.InvokableTool
 }
@@ -333,6 +671,30 @@ func (s *streamableToolWithCallback) Info(ctx context.Context) (*schema.ToolInfo
 
 func (s *streamableToolWithCallback) StreamableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (*schema.StreamReader[string], error) {
 	return streamWithCallbacks(s.st.StreamableRun)(ctx, argumentsInJSON, opts...)
+}
+
+type enhancedInvokableToolWithCallback struct {
+	eiTool tool.EnhancedInvokableTool
+}
+
+func (e *enhancedInvokableToolWithCallback) Info(ctx context.Context) (*schema.ToolInfo, error) {
+	return e.eiTool.Info(ctx)
+}
+
+func (e *enhancedInvokableToolWithCallback) InvokableRun(ctx context.Context, toolArgument *schema.ToolArgument, opts ...tool.Option) (*schema.ToolResult, error) {
+	return invokeEnhancedWithCallbacks(e.eiTool.InvokableRun)(ctx, toolArgument, opts...)
+}
+
+type enhancedStreamableToolWithCallback struct {
+	est tool.EnhancedStreamableTool
+}
+
+func (e *enhancedStreamableToolWithCallback) Info(ctx context.Context) (*schema.ToolInfo, error) {
+	return e.est.Info(ctx)
+}
+
+func (e *enhancedStreamableToolWithCallback) StreamableRun(ctx context.Context, toolArgument *schema.ToolArgument, opts ...tool.Option) (*schema.StreamReader[*schema.ToolResult], error) {
+	return streamEnhancedWithCallbacks(e.est.StreamableRun)(ctx, toolArgument, opts...)
 }
 
 func streamableToInvokable(e StreamableToolEndpoint) InvokableToolEndpoint {
@@ -359,24 +721,61 @@ func invokableToStreamable(e InvokableToolEndpoint) StreamableToolEndpoint {
 	}
 }
 
+func enhancedStreamableToEnhancedInvokable(e EnhancedStreamableToolEndpoint) EnhancedInvokableToolEndpoint {
+	return func(ctx context.Context, input *ToolInput) (*EnhancedInvokableToolOutput, error) {
+		so, err := e(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		o, err := concatStreamReader(so.Result)
+		if err != nil {
+			return nil, fmt.Errorf("failed to concat EnhancedStreamableTool output message stream: %w", err)
+		}
+		return &EnhancedInvokableToolOutput{Result: o}, nil
+	}
+}
+
+func enhancedInvokableToEnhancedStreamable(e EnhancedInvokableToolEndpoint) EnhancedStreamableToolEndpoint {
+	return func(ctx context.Context, input *ToolInput) (*EnhancedStreamableToolOutput, error) {
+		o, err := e(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		return &EnhancedStreamableToolOutput{Result: schema.StreamReaderFromArray([]*schema.ToolResult{o.Result})}, nil
+	}
+}
+
+func invokeEnhancedWithCallbacks(i func(ctx context.Context, toolArgument *schema.ToolArgument, opts ...tool.Option) (*schema.ToolResult, error)) func(ctx context.Context, toolArgument *schema.ToolArgument, opts ...tool.Option) (*schema.ToolResult, error) {
+	return runWithCallbacks(i, onStart[*schema.ToolArgument], onEnd[*schema.ToolResult], onError)
+}
+
+func streamEnhancedWithCallbacks(s func(ctx context.Context, toolArgument *schema.ToolArgument, opts ...tool.Option) (*schema.StreamReader[*schema.ToolResult], error)) func(ctx context.Context, toolArgument *schema.ToolArgument, opts ...tool.Option) (*schema.StreamReader[*schema.ToolResult], error) {
+	return runWithCallbacks(s, onStart[*schema.ToolArgument], onEndWithStreamOutput[*schema.ToolResult], onError)
+}
+
 type toolCallTask struct {
 	// in
-	endpoint       InvokableToolEndpoint
-	streamEndpoint StreamableToolEndpoint
-	meta           *executorMeta
-	name           string
-	arg            string
-	callID         string
+	endpoint                   InvokableToolEndpoint
+	streamEndpoint             StreamableToolEndpoint
+	enhancedInvokableEndpoint  EnhancedInvokableToolEndpoint
+	enhancedStreamableEndpoint EnhancedStreamableToolEndpoint
+	meta                       *executorMeta
+	name                       string
+	arg                        string
+	callID                     string
+	useEnhanced                bool
 
 	// out
-	executed bool
-	output   string
-	sOutput  *schema.StreamReader[string]
-	err      error
+	executed        bool
+	output          string
+	sOutput         *schema.StreamReader[string]
+	enhancedOutput  *schema.ToolResult
+	enhancedSOutput *schema.StreamReader[*schema.ToolResult]
+	err             error
 }
 
 func (tn *ToolsNode) genToolCallTasks(ctx context.Context, tuple *toolsTuple,
-	input *schema.Message, executedTools map[string]string, isStream bool) ([]toolCallTask, error) {
+	input *schema.Message, executedTools map[string]string, executedEnhancedTools map[string]*schema.ToolResult, isStream bool) ([]toolCallTask, error) {
 
 	if input.Role != schema.Assistant {
 		return nil, fmt.Errorf("expected message role is Assistant, got %s", input.Role)
@@ -391,11 +790,25 @@ func (tn *ToolsNode) genToolCallTasks(ctx context.Context, tuple *toolsTuple,
 
 	for i := 0; i < n; i++ {
 		toolCall := input.ToolCalls[i]
+		if enhancedResult, executed := executedEnhancedTools[toolCall.ID]; executed {
+			toolCallTasks[i].name = toolCall.Function.Name
+			toolCallTasks[i].arg = toolCall.Function.Arguments
+			toolCallTasks[i].callID = toolCall.ID
+			toolCallTasks[i].executed = true
+			toolCallTasks[i].useEnhanced = true
+			if isStream {
+				toolCallTasks[i].enhancedSOutput = schema.StreamReaderFromArray([]*schema.ToolResult{enhancedResult})
+			} else {
+				toolCallTasks[i].enhancedOutput = enhancedResult
+			}
+			continue
+		}
 		if result, executed := executedTools[toolCall.ID]; executed {
 			toolCallTasks[i].name = toolCall.Function.Name
 			toolCallTasks[i].arg = toolCall.Function.Arguments
 			toolCallTasks[i].callID = toolCall.ID
 			toolCallTasks[i].executed = true
+			toolCallTasks[i].useEnhanced = false
 			if isStream {
 				toolCallTasks[i].sOutput = schema.StreamReaderFromArray([]string{result})
 			} else {
@@ -410,19 +823,41 @@ func (tn *ToolsNode) genToolCallTasks(ctx context.Context, tuple *toolsTuple,
 			}
 			toolCallTasks[i] = newUnknownToolTask(toolCall.Function.Name, toolCall.Function.Arguments, toolCall.ID, tn.unknownToolHandler)
 		} else {
-			toolCallTasks[i].endpoint = tuple.endpoints[index]
-			toolCallTasks[i].streamEndpoint = tuple.streamEndpoints[index]
 			toolCallTasks[i].meta = tuple.meta[index]
 			toolCallTasks[i].name = toolCall.Function.Name
 			toolCallTasks[i].callID = toolCall.ID
-			if tn.toolArgumentsHandler != nil {
-				arg, err := tn.toolArgumentsHandler(ctx, toolCall.Function.Name, toolCall.Function.Arguments)
+
+			if tuple.enhancedInvokableEndpoints[index] != nil && tuple.enhancedStreamableEndpoints[index] != nil {
+				toolCallTasks[i].enhancedInvokableEndpoint = tuple.enhancedInvokableEndpoints[index]
+				toolCallTasks[i].enhancedStreamableEndpoint = tuple.enhancedStreamableEndpoints[index]
+				toolCallTasks[i].useEnhanced = true
+			} else {
+				toolCallTasks[i].endpoint = tuple.endpoints[index]
+				toolCallTasks[i].streamEndpoint = tuple.streamEndpoints[index]
+				toolCallTasks[i].useEnhanced = false
+			}
+
+			// Get canonical tool name for looking up argument aliases
+			canonicalToolName := tuple.canonicalNames[index]
+
+			// Process argument aliases remapping
+			args := toolCall.Function.Arguments
+			if aliasMap, hasAliases := tuple.argsAliasMap[canonicalToolName]; hasAliases {
+				remappedArgs, err := remapArgs(args, aliasMap)
 				if err != nil {
-					return nil, fmt.Errorf("failed to executed tool[name:%s arguments:%s] arguments handler: %w", toolCall.Function.Name, toolCall.Function.Arguments, err)
+					return nil, fmt.Errorf("failed to remap args for tool[name:%s]: %w", canonicalToolName, err)
+				}
+				args = remappedArgs
+			}
+
+			if tn.toolArgumentsHandler != nil {
+				arg, err := tn.toolArgumentsHandler(ctx, canonicalToolName, args)
+				if err != nil {
+					return nil, fmt.Errorf("failed to executed tool[name:%s arguments:%s] arguments handler: %w", toolCall.Function.Name, args, err)
 				}
 				toolCallTasks[i].arg = arg
 			} else {
-				toolCallTasks[i].arg = toolCall.Function.Arguments
+				toolCallTasks[i].arg = args
 			}
 		}
 	}
@@ -466,17 +901,33 @@ func runToolCallTaskByInvoke(ctx context.Context, task *toolCallTask, opts ...to
 
 	ctx = setToolCallInfo(ctx, &toolCallInfo{toolCallID: task.callID})
 	ctx = appendToolAddressSegment(ctx, task.name, task.callID)
-	output, err := task.endpoint(ctx, &ToolInput{
-		Name:        task.name,
-		Arguments:   task.arg,
-		CallID:      task.callID,
-		CallOptions: opts,
-	})
-	if err != nil {
-		task.err = err
+
+	if task.useEnhanced {
+		enhancedOutput, err := task.enhancedInvokableEndpoint(ctx, &ToolInput{
+			Name:        task.name,
+			Arguments:   task.arg,
+			CallID:      task.callID,
+			CallOptions: opts,
+		})
+		if err != nil {
+			task.err = err
+		} else {
+			task.enhancedOutput = enhancedOutput.Result
+			task.executed = true
+		}
 	} else {
-		task.output = output.Result
-		task.executed = true
+		output, err := task.endpoint(ctx, &ToolInput{
+			Name:        task.name,
+			Arguments:   task.arg,
+			CallID:      task.callID,
+			CallOptions: opts,
+		})
+		if err != nil {
+			task.err = err
+		} else {
+			task.output = output.Result
+			task.executed = true
+		}
 	}
 }
 
@@ -489,17 +940,33 @@ func runToolCallTaskByStream(ctx context.Context, task *toolCallTask, opts ...to
 
 	ctx = setToolCallInfo(ctx, &toolCallInfo{toolCallID: task.callID})
 	ctx = appendToolAddressSegment(ctx, task.name, task.callID)
-	output, err := task.streamEndpoint(ctx, &ToolInput{
-		Name:        task.name,
-		Arguments:   task.arg,
-		CallID:      task.callID,
-		CallOptions: opts,
-	})
-	if err != nil {
-		task.err = err
+
+	if task.useEnhanced {
+		enhancedOutput, err := task.enhancedStreamableEndpoint(ctx, &ToolInput{
+			Name:        task.name,
+			Arguments:   task.arg,
+			CallID:      task.callID,
+			CallOptions: opts,
+		})
+		if err != nil {
+			task.err = err
+		} else {
+			task.enhancedSOutput = enhancedOutput.Result
+			task.executed = true
+		}
 	} else {
-		task.sOutput = output.Result
-		task.executed = true
+		output, err := task.streamEndpoint(ctx, &ToolInput{
+			Name:        task.name,
+			Arguments:   task.arg,
+			CallID:      task.callID,
+			CallOptions: opts,
+		})
+		if err != nil {
+			task.err = err
+		} else {
+			task.sOutput = output.Result
+			task.executed = true
+		}
 	}
 }
 
@@ -549,6 +1016,31 @@ func parallelRunToolCall(ctx context.Context,
 	wg.Wait()
 }
 
+// buildTupleFromOpts rebuilds a toolsTuple when call options override tools or aliases.
+func (tn *ToolsNode) buildTupleFromOpts(ctx context.Context, opt *toolsNodeOptions) (*toolsTuple, error) {
+	tools := opt.ToolList
+	if tools == nil {
+		tools = tn.tools
+	}
+	aliasConfigs := opt.ToolAliases
+	if aliasConfigs == nil {
+		aliasConfigs = tn.toolAliasConfigs
+	}
+	p := convToolsParams{
+		tools:        tools,
+		aliasConfigs: aliasConfigs,
+	}
+	p.middlewares.invokable = tn.toolCallMiddlewares
+	p.middlewares.streamable = tn.streamToolCallMiddlewares
+	p.middlewares.enhancedInvokable = tn.enhancedToolCallMiddlewares
+	p.middlewares.enhancedStreamable = tn.enhancedStreamToolCallMiddlewares
+	tuple, err := convTools(ctx, p)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert tool list from call option: %w", err)
+	}
+	return tuple, nil
+}
+
 // Invoke calls the tools and collects the results of invokable tools.
 // it's parallel if there are multiple tool calls in the input message.
 func (tn *ToolsNode) Invoke(ctx context.Context, input *schema.Message,
@@ -556,23 +1048,27 @@ func (tn *ToolsNode) Invoke(ctx context.Context, input *schema.Message,
 
 	opt := getToolsNodeOptions(opts...)
 	tuple := tn.tuple
-	if opt.ToolList != nil {
+	if opt.ToolList != nil || opt.ToolAliases != nil {
 		var err error
-		tuple, err = convTools(ctx, opt.ToolList, tn.toolCallMiddlewares, tn.streamToolCallMiddlewares)
+		tuple, err = tn.buildTupleFromOpts(ctx, opt)
 		if err != nil {
-			return nil, fmt.Errorf("failed to convert tool list from call option: %w", err)
+			return nil, err
 		}
 	}
 
 	var executedTools map[string]string
+	var executedEnhancedTools map[string]*schema.ToolResult
 	if wasInterrupted, hasState, tnState := GetInterruptState[*toolsInterruptAndRerunState](ctx); wasInterrupted && hasState {
 		input = tnState.Input
 		if tnState.ExecutedTools != nil {
 			executedTools = tnState.ExecutedTools
 		}
+		if tnState.ExecutedEnhancedTools != nil {
+			executedEnhancedTools = tnState.ExecutedEnhancedTools
+		}
 	}
 
-	tasks, err := tn.genToolCallTasks(ctx, tuple, input, executedTools, false)
+	tasks, err := tn.genToolCallTasks(ctx, tuple, input, executedTools, executedEnhancedTools, false)
 	if err != nil {
 		return nil, err
 	}
@@ -587,13 +1083,15 @@ func (tn *ToolsNode) Invoke(ctx context.Context, input *schema.Message,
 	output := make([]*schema.Message, n)
 
 	rerunExtra := &ToolsInterruptAndRerunExtra{
-		ToolCalls:     input.ToolCalls,
-		ExecutedTools: make(map[string]string),
-		RerunExtraMap: make(map[string]any),
+		ToolCalls:             input.ToolCalls,
+		ExecutedTools:         make(map[string]string),
+		ExecutedEnhancedTools: make(map[string]*schema.ToolResult),
+		RerunExtraMap:         make(map[string]any),
 	}
 	rerunState := &toolsInterruptAndRerunState{
-		Input:         input,
-		ExecutedTools: make(map[string]string),
+		Input:                 input,
+		ExecutedTools:         make(map[string]string),
+		ExecutedEnhancedTools: make(map[string]*schema.ToolResult),
 	}
 
 	var errs []error
@@ -616,11 +1114,26 @@ func (tn *ToolsNode) Invoke(ctx context.Context, input *schema.Message,
 			continue
 		}
 		if tasks[i].executed {
-			rerunExtra.ExecutedTools[tasks[i].callID] = tasks[i].output
-			rerunState.ExecutedTools[tasks[i].callID] = tasks[i].output
+			if tasks[i].useEnhanced {
+				rerunExtra.ExecutedEnhancedTools[tasks[i].callID] = tasks[i].enhancedOutput
+				rerunState.ExecutedEnhancedTools[tasks[i].callID] = tasks[i].enhancedOutput
+			} else {
+				rerunExtra.ExecutedTools[tasks[i].callID] = tasks[i].output
+				rerunState.ExecutedTools[tasks[i].callID] = tasks[i].output
+			}
 		}
+
 		if len(errs) == 0 {
-			output[i] = schema.ToolMessage(tasks[i].output, tasks[i].callID, schema.WithToolName(tasks[i].name))
+			if tasks[i].useEnhanced {
+				output[i] = schema.ToolMessage("", tasks[i].callID, schema.WithToolName(tasks[i].name))
+				output[i].UserInputMultiContent, err = tasks[i].enhancedOutput.ToMessageInputParts()
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				output[i] = schema.ToolMessage(tasks[i].output, tasks[i].callID, schema.WithToolName(tasks[i].name))
+			}
+
 		}
 	}
 	if len(errs) > 0 {
@@ -637,23 +1150,27 @@ func (tn *ToolsNode) Stream(ctx context.Context, input *schema.Message,
 
 	opt := getToolsNodeOptions(opts...)
 	tuple := tn.tuple
-	if opt.ToolList != nil {
+	if opt.ToolList != nil || opt.ToolAliases != nil {
 		var err error
-		tuple, err = convTools(ctx, opt.ToolList, tn.toolCallMiddlewares, tn.streamToolCallMiddlewares)
+		tuple, err = tn.buildTupleFromOpts(ctx, opt)
 		if err != nil {
-			return nil, fmt.Errorf("failed to convert tool list from call option: %w", err)
+			return nil, err
 		}
 	}
 
 	var executedTools map[string]string
+	var executedEnhancedTools map[string]*schema.ToolResult
 	if wasInterrupted, hasState, tnState := GetInterruptState[*toolsInterruptAndRerunState](ctx); wasInterrupted && hasState {
 		input = tnState.Input
 		if tnState.ExecutedTools != nil {
 			executedTools = tnState.ExecutedTools
 		}
+		if tnState.ExecutedEnhancedTools != nil {
+			executedEnhancedTools = tnState.ExecutedEnhancedTools
+		}
 	}
 
-	tasks, err := tn.genToolCallTasks(ctx, tuple, input, executedTools, true)
+	tasks, err := tn.genToolCallTasks(ctx, tuple, input, executedTools, executedEnhancedTools, true)
 	if err != nil {
 		return nil, err
 	}
@@ -667,13 +1184,15 @@ func (tn *ToolsNode) Stream(ctx context.Context, input *schema.Message,
 	n := len(tasks)
 
 	rerunExtra := &ToolsInterruptAndRerunExtra{
-		ToolCalls:     input.ToolCalls,
-		ExecutedTools: make(map[string]string),
-		RerunExtraMap: make(map[string]any),
+		ToolCalls:             input.ToolCalls,
+		ExecutedTools:         make(map[string]string),
+		ExecutedEnhancedTools: make(map[string]*schema.ToolResult),
+		RerunExtraMap:         make(map[string]any),
 	}
 	rerunState := &toolsInterruptAndRerunState{
-		Input:         input,
-		ExecutedTools: make(map[string]string),
+		Input:                 input,
+		ExecutedTools:         make(map[string]string),
+		ExecutedEnhancedTools: make(map[string]*schema.ToolResult),
 	}
 	var errs []error
 	// check rerun
@@ -700,12 +1219,22 @@ func (tn *ToolsNode) Stream(ctx context.Context, input *schema.Message,
 		// concat and save tool output
 		for _, t := range tasks {
 			if t.executed {
-				o, err_ := concatStreamReader(t.sOutput)
-				if err_ != nil {
-					return nil, fmt.Errorf("failed to concat tool[name:%s id:%s]'s stream output: %w", t.name, t.callID, err_)
+				if t.useEnhanced {
+					eo, err_ := concatStreamReader(t.enhancedSOutput)
+					if err_ != nil {
+						return nil, fmt.Errorf("failed to concat enhanced tool[name:%s id:%s]'s stream output: %w", t.name, t.callID, err_)
+					}
+					rerunExtra.ExecutedEnhancedTools[t.callID] = eo
+					rerunState.ExecutedEnhancedTools[t.callID] = eo
+
+				} else {
+					o, err_ := concatStreamReader(t.sOutput)
+					if err_ != nil {
+						return nil, fmt.Errorf("failed to concat tool[name:%s id:%s]'s stream output: %w", t.name, t.callID, err_)
+					}
+					rerunExtra.ExecutedTools[t.callID] = o
+					rerunState.ExecutedTools[t.callID] = o
 				}
-				rerunExtra.ExecutedTools[t.callID] = o
-				rerunState.ExecutedTools[t.callID] = o
 			}
 		}
 		return nil, CompositeInterrupt(ctx, rerunExtra, rerunState, errs...)
@@ -717,14 +1246,26 @@ func (tn *ToolsNode) Stream(ctx context.Context, input *schema.Message,
 		index := i
 		callID := tasks[i].callID
 		callName := tasks[i].name
-		cvt := func(s string) ([]*schema.Message, error) {
-			ret := make([]*schema.Message, n)
-			ret[index] = schema.ToolMessage(s, callID, schema.WithToolName(callName))
-
-			return ret, nil
+		if tasks[i].useEnhanced {
+			cvt := func(tr *schema.ToolResult) ([]*schema.Message, error) {
+				ret := make([]*schema.Message, n)
+				ret[index] = schema.ToolMessage("", callID, schema.WithToolName(callName))
+				ret[index].UserInputMultiContent, err = tr.ToMessageInputParts()
+				if err != nil {
+					return nil, err
+				}
+				return ret, nil
+			}
+			sOutput[i] = schema.StreamReaderWithConvert(tasks[i].enhancedSOutput, cvt)
+		} else {
+			cvt := func(s string) ([]*schema.Message, error) {
+				ret := make([]*schema.Message, n)
+				ret[index] = schema.ToolMessage(s, callID, schema.WithToolName(callName))
+				return ret, nil
+			}
+			sOutput[i] = schema.StreamReaderWithConvert(tasks[i].sOutput, cvt)
 		}
 
-		sOutput[i] = schema.StreamReaderWithConvert(tasks[i].sOutput, cvt)
 	}
 	return schema.MergeStreamReaders(sOutput), nil
 }

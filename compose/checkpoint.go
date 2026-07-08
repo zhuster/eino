@@ -19,6 +19,7 @@ package compose
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	"github.com/cloudwego/eino/internal/core"
 	"github.com/cloudwego/eino/internal/serialization"
@@ -204,12 +205,97 @@ func (c *checkPointer) get(ctx context.Context, id string) (*checkpoint, bool, e
 }
 
 func (c *checkPointer) set(ctx context.Context, id string, cp *checkpoint) error {
+	normalizeCheckpointTypedNilInputs(cp)
+
 	data, err := c.serializer.Marshal(cp)
 	if err != nil {
 		return err
 	}
 
 	return c.store.Set(ctx, id, data)
+}
+
+func normalizeCheckpointTypedNilInputs(cp *checkpoint) {
+	if cp == nil {
+		return
+	}
+	for key, input := range cp.Inputs {
+		if isTypedNil(input) {
+			cp.Inputs[key] = nil
+		}
+	}
+	for _, sub := range cp.SubGraphs {
+		normalizeCheckpointTypedNilInputs(sub)
+	}
+}
+
+func isTypedNil(v any) bool {
+	if v == nil {
+		return false
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
+// MigrateCheckpointState is an advanced compatibility utility for checkpoint upgrades.
+//
+// It decodes checkpoint bytes using the given serializer, applies migrate to checkpoint.State and
+// all nested SubGraphs' states, then re-encodes the checkpoint.
+//
+// Typical use cases:
+//   - Resume-time migration when you changed your graph state type/schema and need to load old
+//     checkpoints without discarding them.
+//   - Framework-level backward compatibility (e.g. ADK upgrading checkpoints across versions).
+//
+// Migrate callback contract:
+//   - Returns (newState, changed, error).
+//   - If changed is false, the state is left as-is.
+//   - If error is non-nil, migration stops and the error is returned to the caller.
+//
+// The original bytes are returned only if no state was changed anywhere in the checkpoint tree.
+func MigrateCheckpointState(data []byte, serializer Serializer, migrate func(state any) (any, bool, error)) ([]byte, error) {
+	cp := &checkpoint{}
+	if err := serializer.Unmarshal(data, cp); err != nil {
+		return nil, err
+	}
+	changed, err := migrateCheckpoint(cp, migrate)
+	if err != nil {
+		return nil, err
+	}
+	if !changed {
+		return data, nil
+	}
+	return serializer.Marshal(cp)
+}
+
+// migrateCheckpoint recursively applies migrate to cp.State and all SubGraphs.
+func migrateCheckpoint(cp *checkpoint, migrate func(state any) (any, bool, error)) (bool, error) {
+	anyChanged := false
+	if cp.State != nil {
+		newState, changed, err := migrate(cp.State)
+		if err != nil {
+			return false, err
+		}
+		if changed {
+			cp.State = newState
+			anyChanged = true
+		}
+	}
+	for _, sub := range cp.SubGraphs {
+		changed, err := migrateCheckpoint(sub, migrate)
+		if err != nil {
+			return false, err
+		}
+		if changed {
+			anyChanged = true
+		}
+	}
+	return anyChanged, nil
 }
 
 // convertCheckPoint if value in checkpoint is streamReader, convert it to non-stream

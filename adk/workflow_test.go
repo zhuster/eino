@@ -18,10 +18,13 @@ package adk
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/cloudwego/eino/callbacks"
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -305,11 +308,12 @@ func TestParallelAgent(t *testing.T) {
 		assert.NoError(t, err)
 
 		// Check the source agent name and message content
-		if event.AgentName == "Agent1" {
+		switch event.AgentName {
+		case "Agent1":
 			assert.Equal(t, "Response from Agent1", msg.Content)
-		} else if event.AgentName == "Agent2" {
+		case "Agent2":
 			assert.Equal(t, "Response from Agent2", msg.Content)
-		} else {
+		default:
 			t.Fatalf("Unexpected source agent name: %s", event.AgentName)
 		}
 	}
@@ -663,9 +667,10 @@ func TestParallelWorkflowResumeWithEvents(t *testing.T) {
 		// Verify specific properties of each event
 		var sa3Event, sa4Event *AgentEvent
 		for _, event := range events {
-			if event.AgentName == "sa3" {
+			switch event.AgentName {
+			case "sa3":
 				sa3Event = event
-			} else if event.AgentName == "sa4" {
+			case "sa4":
 				sa4Event = event
 			}
 		}
@@ -693,9 +698,10 @@ func TestParallelWorkflowResumeWithEvents(t *testing.T) {
 
 		var sa1InfoFound, sa2InfoFound bool
 		for _, ctx := range interruptEvent.Action.Interrupted.InterruptContexts {
-			if ctx.Info == "sa1 interrupt data" {
+			switch ctx.Info {
+			case "sa1 interrupt data":
 				sa1InfoFound = true
-			} else if ctx.Info == "sa2 interrupt data" {
+			case "sa2 interrupt data":
 				sa2InfoFound = true
 			}
 		}
@@ -706,9 +712,10 @@ func TestParallelWorkflowResumeWithEvents(t *testing.T) {
 
 		var parallelInterruptID1, parallelInterruptID2 string
 		for _, ctx := range interruptEvent.Action.Interrupted.InterruptContexts {
-			if ctx.Info == "sa1 interrupt data" {
+			switch ctx.Info {
+			case "sa1 interrupt data":
 				parallelInterruptID1 = ctx.ID
-			} else if ctx.Info == "sa2 interrupt data" {
+			case "sa2 interrupt data":
 				parallelInterruptID2 = ctx.ID
 			}
 		}
@@ -983,9 +990,10 @@ func TestNestedParallelWorkflow(t *testing.T) {
 	// Resume the inner parallel workflow
 	var innerInterruptID1, innerInterruptID2 string
 	for _, ctx := range interruptEvent.Action.Interrupted.InterruptContexts {
-		if ctx.Info == "inner1 interrupt" {
+		switch ctx.Info {
+		case "inner1 interrupt":
 			innerInterruptID1 = ctx.ID
-		} else if ctx.Info == "inner2 interrupt" {
+		case "inner2 interrupt":
 			innerInterruptID2 = ctx.ID
 		}
 	}
@@ -1018,7 +1026,7 @@ func TestWorkflowAgentUnsupportedMode(t *testing.T) {
 		name:        "UnsupportedModeAgent",
 		description: "Agent with unsupported mode",
 		subAgents:   []*flowAgent{},
-		mode:        workflowAgentMode(999), // Invalid mode
+		mode:        workflowAgentMode(999),
 	}
 
 	// Run the agent and expect error
@@ -1083,4 +1091,271 @@ func TestFilterOptions(t *testing.T) {
 	iter = parAgent.Run(ctx, &AgentInput{}, withValue("Agent1").DesignateAgent("Agent1"), withValue("Agent2").DesignateAgent("Agent2"))
 	_, ok = iter.Next()
 	assert.False(t, ok)
+}
+
+func TestLoopAgentWithError(t *testing.T) {
+	ctx := context.Background()
+
+	iterationCount := 0
+	agent := &myAgent{
+		name: "ErrorAgent",
+		runFn: func(ctx context.Context, input *AgentInput, options ...AgentRunOption) *AsyncIterator[*AgentEvent] {
+			iter, generator := NewAsyncIteratorPair[*AgentEvent]()
+			go func() {
+				defer generator.Close()
+				iterationCount++
+				if iterationCount == 3 {
+					generator.Send(&AgentEvent{Err: fmt.Errorf("error on iteration %d", iterationCount)})
+					return
+				}
+				generator.Send(&AgentEvent{
+					Output: &AgentOutput{
+						MessageOutput: &MessageVariant{
+							Message: schema.AssistantMessage(fmt.Sprintf("iteration %d", iterationCount), nil),
+							Role:    schema.Assistant,
+						},
+					},
+				})
+			}()
+			return iter
+		},
+	}
+
+	loopAgent, err := NewLoopAgent(ctx, &LoopAgentConfig{
+		Name:          "LoopErrorTestAgent",
+		SubAgents:     []Agent{agent},
+		MaxIterations: 10,
+	})
+	assert.NoError(t, err)
+
+	input := &AgentInput{Messages: []Message{schema.UserMessage("test")}}
+	ctx, _ = initRunCtx(ctx, loopAgent.Name(ctx), input)
+	iterator := loopAgent.Run(ctx, input)
+
+	var events []*AgentEvent
+	var errorEvent *AgentEvent
+	for {
+		event, ok := iterator.Next()
+		if !ok {
+			break
+		}
+		if event.Err != nil {
+			errorEvent = event
+		} else {
+			events = append(events, event)
+		}
+	}
+
+	assert.Equal(t, 2, len(events), "should have 2 successful iterations before error")
+	assert.NotNil(t, errorEvent, "should have received error event")
+	assert.Contains(t, errorEvent.Err.Error(), "error on iteration 3")
+	assert.Equal(t, 3, iterationCount, "loop should stop at iteration 3")
+}
+
+func TestWorkflowCallbackHandlerNotDoubled(t *testing.T) {
+	ctx := context.Background()
+	store := newMyStore()
+
+	var globalCallbackCount int
+	var designatedCallbackCount int
+	var mu sync.Mutex
+
+	globalHandler := callbacks.NewHandlerBuilder().OnStartFn(
+		func(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+			if info.Component == ComponentOfAgent && info.Name == "SubSubAgent" {
+				mu.Lock()
+				globalCallbackCount++
+				mu.Unlock()
+			}
+			return ctx
+		}).Build()
+
+	designatedHandler := callbacks.NewHandlerBuilder().OnStartFn(
+		func(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+			if info.Component == ComponentOfAgent && info.Name == "SubSubAgent" {
+				mu.Lock()
+				designatedCallbackCount++
+				mu.Unlock()
+			}
+			return ctx
+		}).Build()
+
+	iterationCount := 0
+	shouldInterrupt := true
+	subSubAgent := &myAgent{
+		name: "SubSubAgent",
+		runFn: func(ctx context.Context, input *AgentInput, options ...AgentRunOption) *AsyncIterator[*AgentEvent] {
+			iter, generator := NewAsyncIteratorPair[*AgentEvent]()
+			go func() {
+				defer generator.Close()
+				iterationCount++
+				if shouldInterrupt && iterationCount == 2 {
+					generator.Send(Interrupt(ctx, "test_interrupt"))
+					return
+				}
+				generator.Send(&AgentEvent{
+					Output: &AgentOutput{
+						MessageOutput: &MessageVariant{
+							Message: schema.AssistantMessage(fmt.Sprintf("iteration %d", iterationCount), nil),
+							Role:    schema.Assistant,
+						},
+					},
+				})
+			}()
+			return iter
+		},
+		resumeFn: func(ctx context.Context, info *ResumeInfo, opts ...AgentRunOption) *AsyncIterator[*AgentEvent] {
+			iter, generator := NewAsyncIteratorPair[*AgentEvent]()
+			go func() {
+				defer generator.Close()
+				iterationCount++
+				generator.Send(&AgentEvent{
+					Output: &AgentOutput{
+						MessageOutput: &MessageVariant{
+							Message: schema.AssistantMessage(fmt.Sprintf("resumed iteration %d", iterationCount), nil),
+							Role:    schema.Assistant,
+						},
+					},
+				})
+			}()
+			return iter
+		},
+	}
+
+	subWorkflow, err := NewLoopAgent(ctx, &LoopAgentConfig{
+		Name:          "SubWorkflow",
+		SubAgents:     []Agent{subSubAgent},
+		MaxIterations: 2,
+	})
+	assert.NoError(t, err)
+
+	parentWorkflow, err := NewLoopAgent(ctx, &LoopAgentConfig{
+		Name:          "ParentWorkflow",
+		SubAgents:     []Agent{subWorkflow},
+		MaxIterations: 2,
+	})
+	assert.NoError(t, err)
+
+	runner := NewRunner(ctx, RunnerConfig{
+		Agent:           parentWorkflow,
+		CheckPointStore: store,
+	})
+
+	opts := []AgentRunOption{
+		WithCallbacks(globalHandler),
+		WithCallbacks(designatedHandler).DesignateAgent("ParentWorkflow", "SubSubAgent"),
+		WithCheckPointID("cp1"),
+	}
+
+	iterator := runner.Run(ctx, []Message{schema.UserMessage("test")}, opts...)
+
+	var interruptEvent *AgentEvent
+	for {
+		event, ok := iterator.Next()
+		if !ok {
+			break
+		}
+		if event.Action != nil && event.Action.Interrupted != nil {
+			interruptEvent = event
+		}
+	}
+
+	assert.NotNil(t, interruptEvent)
+	assert.Equal(t, 2, iterationCount)
+	assert.Equal(t, 2, globalCallbackCount)
+	assert.Equal(t, 2, designatedCallbackCount)
+
+	shouldInterrupt = false
+	var rootCauseID string
+	for _, intCtx := range interruptEvent.Action.Interrupted.InterruptContexts {
+		if intCtx.IsRootCause {
+			rootCauseID = intCtx.ID
+			break
+		}
+	}
+
+	resumeIter, err := runner.ResumeWithParams(ctx, "cp1", &ResumeParams{
+		Targets: map[string]any{rootCauseID: nil},
+	}, opts...)
+	assert.NoError(t, err)
+
+	for {
+		_, ok := resumeIter.Next()
+		if !ok {
+			break
+		}
+	}
+
+	assert.Equal(t, 5, iterationCount)
+	assert.Equal(t, 5, globalCallbackCount)
+	assert.Equal(t, 5, designatedCallbackCount)
+}
+
+func TestLoopAgentWithBreakLoopFollowedByMoreEvents(t *testing.T) {
+	ctx := context.Background()
+
+	agent := newMockAgent("SubAgent", "Sub agent", []*AgentEvent{
+		{
+			AgentName: "SubAgent",
+			Output: &AgentOutput{
+				MessageOutput: &MessageVariant{
+					IsStreaming: false,
+					Message:     schema.ToolMessage("tool result", "call_123"),
+					Role:        schema.Tool,
+				},
+			},
+			Action: NewBreakLoopAction("SubAgent"),
+		},
+		{
+			AgentName: "SubAgent",
+			Output: &AgentOutput{
+				MessageOutput: &MessageVariant{
+					IsStreaming: false,
+					Message:     schema.AssistantMessage("Final response after tool", nil),
+					Role:        schema.Assistant,
+				},
+			},
+		},
+	})
+
+	loopAgent, err := NewLoopAgent(ctx, &LoopAgentConfig{
+		Name:          "LoopTestAgent",
+		Description:   "Test loop agent",
+		SubAgents:     []Agent{agent},
+		MaxIterations: 3,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, loopAgent)
+
+	input := &AgentInput{
+		Messages: []Message{
+			schema.UserMessage("Test input"),
+		},
+	}
+	ctx, _ = initRunCtx(ctx, loopAgent.Name(ctx), input)
+
+	iterator := loopAgent.Run(ctx, input)
+	assert.NotNil(t, iterator)
+
+	var events []*AgentEvent
+	for {
+		event, ok := iterator.Next()
+		if !ok {
+			break
+		}
+		events = append(events, event)
+	}
+
+	assert.Equal(t, 2, len(events), "should have 2 events (tool event with BreakLoop + final response) and loop should break")
+
+	assert.NotNil(t, events[0].Action, "first event should have an action")
+	assert.NotNil(t, events[0].Action.BreakLoop, "first event should have BreakLoop action")
+	assert.True(t, events[0].Action.BreakLoop.Done, "BreakLoop should be marked as Done")
+	assert.Equal(t, "SubAgent", events[0].Action.BreakLoop.From)
+	assert.Equal(t, 0, events[0].Action.BreakLoop.CurrentIterations)
+	assert.Equal(t, schema.Tool, events[0].Output.MessageOutput.Role, "first event should be tool message")
+
+	assert.Nil(t, events[1].Action, "second event should not have an action")
+	assert.Equal(t, schema.Assistant, events[1].Output.MessageOutput.Role, "second event should be assistant message")
+	assert.Equal(t, "Final response after tool", events[1].Output.MessageOutput.Message.Content)
 }

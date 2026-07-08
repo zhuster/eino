@@ -20,7 +20,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"sync"
 	"time"
@@ -36,6 +38,11 @@ type runSession struct {
 	Events     []*agentEventWrapper
 	LaneEvents *laneEvents
 	mtx        sync.Mutex
+
+	// TypedEvents stores *[]*typedAgentEventWrapper[M] for M != *schema.Message.
+	// For M = *schema.Message, the existing Events field is used instead.
+	// The any type is required because Go does not support generic fields in non-generic structs.
+	TypedEvents any
 }
 
 // laneEvents CheckpointSchema: persisted via serialization.RunCtx (gob).
@@ -62,11 +69,116 @@ type agentEventWrapper struct {
 	StreamErr error
 }
 
+type typedAgentEventWrapper[M MessageType] struct {
+	event               *TypedAgentEvent[M]
+	mu                  sync.Mutex
+	concatenatedMessage M
+	TS                  int64
+	StreamErr           error
+}
+
+// typedAgentEventWrapperForGob is a gob-serializable representation of typedAgentEventWrapper.
+// We encode the event and TS separately to avoid the sync.Mutex and non-exported fields.
+type typedAgentEventWrapperForGob[M MessageType] struct {
+	Event *TypedAgentEvent[M]
+	TS    int64
+}
+
+func (e *typedAgentEventWrapper[M]) GobEncode() ([]byte, error) {
+	if e.event != nil && e.event.Output != nil && e.event.Output.MessageOutput != nil && e.event.Output.MessageOutput.IsStreaming {
+		// Materialize the stream before encoding.
+		if isNilMessage(e.concatenatedMessage) && e.StreamErr == nil {
+			e.consumeStream()
+		}
+	}
+
+	buf := &bytes.Buffer{}
+	err := gob.NewEncoder(buf).Encode(&typedAgentEventWrapperForGob[M]{
+		Event: e.event,
+		TS:    e.TS,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to gob encode generic agent event wrapper: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+func (e *typedAgentEventWrapper[M]) GobDecode(b []byte) error {
+	g := &typedAgentEventWrapperForGob[M]{}
+	if err := gob.NewDecoder(bytes.NewReader(b)).Decode(g); err != nil {
+		return fmt.Errorf("failed to gob decode generic agent event wrapper: %w", err)
+	}
+	e.event = g.Event
+	e.TS = g.TS
+	return nil
+}
+
+// consumeStream drains the typed message stream, setting concatenatedMessage on success
+// or StreamErr on failure. The stream is replaced with a materialized version safe for
+// gob encoding.
+//
+// NOTE: This method parallels agentEventWrapper.consumeStream in utils.go. The two
+// implementations exist because agentEventWrapper is non-generic (uses *schema.Message
+// directly) while typedAgentEventWrapper[M] is generic. They cannot be unified without
+// making the non-generic wrapper generic, which would cascade through the entire
+// non-generic event storage layer.
+func (e *typedAgentEventWrapper[M]) consumeStream() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if !isNilMessage(e.concatenatedMessage) {
+		return
+	}
+
+	s := e.event.Output.MessageOutput.MessageStream
+	var msgs []M
+
+	defer s.Close()
+	for {
+		msg, err := s.Recv()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			e.StreamErr = err
+			e.event.Output.MessageOutput.MessageStream = schema.StreamReaderFromArray(msgs)
+			return
+		}
+		msgs = append(msgs, msg)
+	}
+
+	if len(msgs) == 0 {
+		e.StreamErr = errors.New("no messages in typedAgentEventWrapper.MessageStream")
+		e.event.Output.MessageOutput.MessageStream = schema.StreamReaderFromArray(msgs)
+		return
+	}
+
+	if len(msgs) == 1 {
+		e.concatenatedMessage = msgs[0]
+	} else {
+		var err error
+		e.concatenatedMessage, err = concatMessageStream(schema.StreamReaderFromArray(msgs))
+		if err != nil {
+			e.StreamErr = err
+			e.event.Output.MessageOutput.MessageStream = schema.StreamReaderFromArray(msgs)
+			return
+		}
+	}
+
+	e.event.Output.MessageOutput.MessageStream = schema.StreamReaderFromArray([]M{e.concatenatedMessage})
+}
+
 type otherAgentEventWrapperForEncode agentEventWrapper
 
 func (a *agentEventWrapper) GobEncode() ([]byte, error) {
-	if a.concatenatedMessage != nil && a.Output != nil && a.Output.MessageOutput != nil && a.Output.MessageOutput.IsStreaming {
-		a.Output.MessageOutput.MessageStream = schema.StreamReaderFromArray([]Message{a.concatenatedMessage})
+	if a.Output != nil && a.Output.MessageOutput != nil && a.Output.MessageOutput.IsStreaming {
+		// Materialize the stream before encoding. An unconsumed stream that
+		// ends with a non-EOF error (WillRetryError, ErrStreamCanceled) would
+		// cause MessageVariant.GobEncode to fail. consumeStream replaces the
+		// stream with an error-free, materialized version.
+		if a.concatenatedMessage == nil && a.StreamErr == nil {
+			a.consumeStream()
+		}
 	}
 
 	buf := &bytes.Buffer{}
@@ -180,6 +292,24 @@ func (rs *runSession) getEvents() []*agentEventWrapper {
 	return finalEvents
 }
 
+func addTypedEvent[M MessageType](session *runSession, event *TypedAgentEvent[M]) {
+	var zero M
+	if _, ok := any(zero).(*schema.Message); ok {
+		session.addEvent(any(event).(*AgentEvent))
+		return
+	}
+	session.mtx.Lock()
+	defer session.mtx.Unlock()
+	wrapper := &typedAgentEventWrapper[M]{event: event, TS: time.Now().UnixNano()}
+	store, _ := session.TypedEvents.(*[]*typedAgentEventWrapper[M])
+	if store == nil {
+		s := make([]*typedAgentEventWrapper[M], 0)
+		store = &s
+		session.TypedEvents = store
+	}
+	*store = append(*store, wrapper)
+}
+
 func (rs *runSession) getValues() map[string]any {
 	rs.valuesMtx.Lock()
 	values := make(map[string]any, len(rs.Values))
@@ -217,6 +347,8 @@ type runContext struct {
 	RootInput *AgentInput
 	RunPath   []RunStep
 
+	AgenticRootInput any
+
 	Session *runSession
 }
 
@@ -226,9 +358,10 @@ func (rc *runContext) isRoot() bool {
 
 func (rc *runContext) deepCopy() *runContext {
 	copied := &runContext{
-		RootInput: rc.RootInput,
-		RunPath:   make([]RunStep, len(rc.RunPath)),
-		Session:   rc.Session,
+		RootInput:        rc.RootInput,
+		AgenticRootInput: rc.AgenticRootInput,
+		RunPath:          make([]RunStep, len(rc.RunPath)),
+		Session:          rc.Session,
 	}
 
 	copy(copied.RunPath, rc.RunPath)
@@ -258,9 +391,30 @@ func initRunCtx(ctx context.Context, agentName string, input *AgentInput) (conte
 		runCtx = &runContext{Session: newRunSession()}
 	}
 
-	runCtx.RunPath = append(runCtx.RunPath, RunStep{agentName})
+	runCtx.RunPath = append(runCtx.RunPath, RunStep{agentName: agentName})
 	if runCtx.isRoot() && input != nil {
 		runCtx.RootInput = input
+	}
+
+	return setRunCtx(ctx, runCtx), runCtx
+}
+
+func initTypedRunCtx[M MessageType](ctx context.Context, agentName string, input *TypedAgentInput[M]) (context.Context, *runContext) {
+	runCtx := getRunCtx(ctx)
+	if runCtx != nil {
+		runCtx = runCtx.deepCopy()
+	} else {
+		runCtx = &runContext{Session: newRunSession()}
+	}
+
+	runCtx.RunPath = append(runCtx.RunPath, RunStep{agentName: agentName})
+	if runCtx.isRoot() && input != nil {
+		var zero M
+		if _, ok := any(zero).(*schema.Message); ok {
+			runCtx.RootInput = any(input).(*AgentInput)
+		} else {
+			runCtx.AgenticRootInput = input
+		}
 	}
 
 	return setRunCtx(ctx, runCtx), runCtx
@@ -366,7 +520,7 @@ func updateRunPathOnly(ctx context.Context, agentNames ...string) context.Contex
 	}
 
 	for _, agentName := range agentNames {
-		runCtx.RunPath = append(runCtx.RunPath, RunStep{agentName})
+		runCtx.RunPath = append(runCtx.RunPath, RunStep{agentName: agentName})
 	}
 
 	return setRunCtx(ctx, runCtx)
@@ -380,7 +534,7 @@ func ClearRunCtx(ctx context.Context) context.Context {
 	return context.WithValue(ctx, runCtxKey{}, nil)
 }
 
-func ctxWithNewRunCtx(ctx context.Context, input *AgentInput, sharedParentSession bool) context.Context {
+func ctxWithNewTypedRunCtx[M MessageType](ctx context.Context, input *TypedAgentInput[M], sharedParentSession bool) context.Context {
 	var session *runSession
 	if sharedParentSession {
 		if parentSession := getSession(ctx); parentSession != nil {
@@ -393,7 +547,14 @@ func ctxWithNewRunCtx(ctx context.Context, input *AgentInput, sharedParentSessio
 	if session == nil {
 		session = newRunSession()
 	}
-	return setRunCtx(ctx, &runContext{Session: session, RootInput: input})
+	var zero M
+	rc := &runContext{Session: session}
+	if _, ok := any(zero).(*schema.Message); ok {
+		rc.RootInput = any(input).(*AgentInput)
+	} else {
+		rc.AgenticRootInput = input
+	}
+	return setRunCtx(ctx, rc)
 }
 
 func getSession(ctx context.Context) *runSession {
