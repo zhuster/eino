@@ -18,6 +18,7 @@ package compose
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 
@@ -119,6 +120,29 @@ type checkpoint struct {
 
 type stateModifierKey struct{}
 type checkPointKey struct{} // *checkpoint
+
+func withSubGraphCheckpointPublisher(opts []any) (
+	[]any,
+	<-chan *subGraphInterruptError,
+) {
+	ready := make(chan *subGraphInterruptError, 1)
+	childOpts := append([]any(nil), opts...)
+	childOpts = append(childOpts, Option{
+		subGraphCheckpointPublisher: func(checkpoint *subGraphInterruptError) {
+			ready <- checkpoint
+		},
+	})
+	return childOpts, ready
+}
+
+func getSubGraphCheckpointPublisher(opts ...Option) func(*subGraphInterruptError) {
+	for _, opt := range opts {
+		if opt.subGraphCheckpointPublisher != nil {
+			return opt.subGraphCheckpointPublisher
+		}
+	}
+	return nil
+}
 
 func getStateModifier(ctx context.Context) StateModifier {
 	if sm, ok := ctx.Value(stateModifierKey{}).(StateModifier); ok {
@@ -299,22 +323,108 @@ func migrateCheckpoint(cp *checkpoint, migrate func(state any) (any, bool, error
 }
 
 // convertCheckPoint if value in checkpoint is streamReader, convert it to non-stream
-func (c *checkPointer) convertCheckPoint(cp *checkpoint, isStream bool) (err error) {
+func (c *checkPointer) convertCheckPoint(
+	cp *checkpoint,
+	isStream bool,
+	interrupt *core.InterruptSignal,
+) (err error) {
+	toolRerunInputs := make(map[string]*schema.Message)
+	handleStreamError := func(key string, err error) streamErrorAction {
+		toolStreamErr := &toolStreamCheckpointError{}
+		if errors.As(err, &toolStreamErr) {
+			applyToolStreamCheckpoint(cp, key, interrupt, toolStreamErr)
+			if toolStreamErr.nodeKey != "" && toolStreamErr.input != nil {
+				toolRerunInputs[toolStreamErr.nodeKey] = toolStreamErr.input
+			}
+			return streamErrorAction{ignore: true, dropValue: true}
+		}
+		// The checkpoint maps already carry this control signal. A copied data
+		// stream may surface it again while being materialized.
+		return streamErrorAction{ignore: checkpointContainsInterrupt(cp, err)}
+	}
 	for _, ch := range cp.Channels {
 		err = ch.convertValues(func(m map[string]any) error {
-			return c.sc.convertOutputs(isStream, m)
+			return c.sc.convertOutputs(isStream, m, handleStreamError)
 		})
 		if err != nil {
 			return err
 		}
 	}
 
-	err = c.sc.convertInputs(isStream, cp.Inputs)
+	err = c.sc.convertInputs(isStream, cp.Inputs, handleStreamError)
 	if err != nil {
 		return err
 	}
+	for nodeKey, input := range toolRerunInputs {
+		cp.Inputs[nodeKey] = input
+	}
 
 	return nil
+}
+
+func checkpointContainsInterrupt(cp *checkpoint, err error) bool {
+	if cp == nil || err == nil {
+		return false
+	}
+
+	signal := &core.InterruptSignal{}
+	if errors.As(err, &signal) {
+		_, ok := cp.InterruptID2Addr[signal.ID]
+		return ok
+	}
+
+	if nested := isSubGraphInterrupt(err); nested != nil && nested.signal != nil {
+		_, ok := cp.InterruptID2Addr[nested.signal.ID]
+		return ok
+	}
+
+	return false
+}
+
+func applyToolStreamCheckpoint(
+	cp *checkpoint,
+	inputKey string,
+	interrupt *core.InterruptSignal,
+	streamErr *toolStreamCheckpointError,
+) {
+	rerunNodes := cp.RerunNodes[:0]
+	for _, nodeKey := range cp.RerunNodes {
+		if nodeKey != inputKey {
+			rerunNodes = append(rerunNodes, nodeKey)
+		}
+	}
+	cp.RerunNodes = rerunNodes
+	if streamErr.nodeKey != "" {
+		cp.RerunNodes = appendIfNotExist(cp.RerunNodes, streamErr.nodeKey)
+	}
+	if interrupt != nil {
+		appendInterruptSignalIfMissing(interrupt, streamErr.signal)
+		cp.InterruptID2Addr, cp.InterruptID2State = core.SignalToPersistenceMaps(interrupt)
+	}
+}
+
+func appendInterruptSignalIfMissing(root, signal *core.InterruptSignal) {
+	if root == nil || signal == nil {
+		return
+	}
+	var contains func(*core.InterruptSignal) bool
+	contains = func(current *core.InterruptSignal) bool {
+		if current == nil {
+			return false
+		}
+		if current == signal || signal.ID != "" && current.ID == signal.ID {
+			return true
+		}
+		for _, child := range current.Subs {
+			if contains(child) {
+				return true
+			}
+		}
+		return false
+	}
+	if !contains(root) {
+		root.Subs = append(root.Subs, signal)
+	}
 }
 
 // convertCheckPoint convert values in checkpoint to streamReader if needed
@@ -347,23 +457,43 @@ type streamConverter struct {
 	inputPairs, outputPairs map[string]streamConvertPair
 }
 
-func (s *streamConverter) convertInputs(isStream bool, values map[string]any) error {
-	return convert(values, s.inputPairs, isStream)
+type streamErrorAction struct {
+	ignore    bool
+	dropValue bool
+}
+
+type streamErrorHandler func(key string, err error) streamErrorAction
+
+func (s *streamConverter) convertInputs(
+	isStream bool,
+	values map[string]any,
+	handleError streamErrorHandler,
+) error {
+	return convert(values, s.inputPairs, isStream, handleError)
 }
 
 func (s *streamConverter) restoreInputs(isStream bool, values map[string]any) error {
 	return restore(values, s.inputPairs, isStream)
 }
 
-func (s *streamConverter) convertOutputs(isStream bool, values map[string]any) error {
-	return convert(values, s.outputPairs, isStream)
+func (s *streamConverter) convertOutputs(
+	isStream bool,
+	values map[string]any,
+	handleError streamErrorHandler,
+) error {
+	return convert(values, s.outputPairs, isStream, handleError)
 }
 
 func (s *streamConverter) restoreOutputs(isStream bool, values map[string]any) error {
 	return restore(values, s.outputPairs, isStream)
 }
 
-func convert(values map[string]any, convPairs map[string]streamConvertPair, isStream bool) error {
+func convert(
+	values map[string]any,
+	convPairs map[string]streamConvertPair,
+	isStream bool,
+	handleError streamErrorHandler,
+) error {
 	if !isStream {
 		return nil
 	}
@@ -372,15 +502,29 @@ func convert(values map[string]any, convPairs map[string]streamConvertPair, isSt
 		if !ok {
 			return fmt.Errorf("checkpoint conv stream fail, node[%s] have not been registered", key)
 		}
+		if convPair.concatStream == nil {
+			return fmt.Errorf("checkpoint conv stream fail, node[%s] has no stream converter", key)
+		}
 		sr, ok := v.(streamReader)
 		if !ok {
 			return fmt.Errorf("checkpoint conv stream fail, value of [%s] isn't stream", key)
 		}
-		nValue, err := convPair.concatStream(sr)
+		var action streamErrorAction
+		nValue, err := convPair.concatStream(sr, func(streamErr error) bool {
+			if handleError == nil {
+				return false
+			}
+			action = handleError(key, streamErr)
+			return action.ignore
+		})
 		if err != nil {
 			return err
 		}
-		values[key] = nValue
+		if action.dropValue {
+			delete(values, key)
+		} else {
+			values[key] = nValue
+		}
 	}
 	return nil
 }
@@ -393,6 +537,9 @@ func restore(values map[string]any, convPairs map[string]streamConvertPair, isSt
 		convPair, ok := convPairs[key]
 		if !ok {
 			return fmt.Errorf("checkpoint restore stream fail, node[%s] have not been registered", key)
+		}
+		if convPair.restoreStream == nil {
+			return fmt.Errorf("checkpoint restore stream fail, node[%s] has no stream converter", key)
 		}
 		sr, err := convPair.restoreStream(v)
 		if err != nil {

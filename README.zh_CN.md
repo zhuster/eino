@@ -3,9 +3,9 @@
 ![coverage](https://raw.githubusercontent.com/cloudwego/eino/badges/.badges/main/coverage.svg)
 [![Release](https://img.shields.io/github/v/release/cloudwego/eino)](https://github.com/cloudwego/eino/releases)
 [![WebSite](https://img.shields.io/website?up_message=cloudwego&url=https%3A%2F%2Fwww.cloudwego.io%2F)](https://www.cloudwego.io/)
-[![License](https://img.shields.io/github/license/cloudwego/eino)](https://github.com/cloudwego/eino/blob/main/LICENSE)
+[![License](https://img.shields.io/github/license/cloudwego/eino)](https://github.com/cloudwego/eino/blob/main/LICENSE-APACHE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/cloudwego/eino)](https://goreportcard.com/report/github.com/cloudwego/eino)
-[![OpenIssue](https://img.shields.io/github/issues/cloudwego/eino)](https://github.com/cloudwego/kitex/eino)
+[![OpenIssue](https://img.shields.io/github/issues/cloudwego/eino)](https://github.com/cloudwego/eino/issues)
 [![ClosedIssue](https://img.shields.io/github/issues-closed/cloudwego/eino)](https://github.com/cloudwego/eino/issues?q=is%3Aissue+is%3Aclosed)
 ![Stars](https://img.shields.io/github/stars/cloudwego/eino)
 ![Forks](https://img.shields.io/github/forks/cloudwego/eino)
@@ -22,7 +22,7 @@ Eino 提供：
 - **编排**：把组件组装成图或工作流，既能独立运行，也能作为工具给智能体调用
 - **[示例](https://github.com/cloudwego/eino-examples)**：常见模式和实际场景的可运行代码
 
-![](.github/static/img/eino/eino_concept.jpeg)
+![](.github/static/img/eino/eino_project_structure_and_modules.png)
 
 # 快速上手
 
@@ -157,7 +157,7 @@ Eino 在编排中自动处理流式：拼接、装箱、合并、复制。组件
 
 # 框架结构
 
-![](.github/static/img/eino/eino_framework.jpeg)
+![](.github/static/img/eino/eino_architecture_overview.png)
 
 Eino 框架包含：
 

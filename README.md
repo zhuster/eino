@@ -3,9 +3,9 @@
 ![coverage](https://raw.githubusercontent.com/cloudwego/eino/badges/.badges/main/coverage.svg)
 [![Release](https://img.shields.io/github/v/release/cloudwego/eino)](https://github.com/cloudwego/eino/releases)
 [![WebSite](https://img.shields.io/website?up_message=cloudwego&url=https%3A%2F%2Fwww.cloudwego.io%2F)](https://www.cloudwego.io/)
-[![License](https://img.shields.io/github/license/cloudwego/eino)](https://github.com/cloudwego/eino/blob/main/LICENSE)
+[![License](https://img.shields.io/github/license/cloudwego/eino)](https://github.com/cloudwego/eino/blob/main/LICENSE-APACHE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/cloudwego/eino)](https://goreportcard.com/report/github.com/cloudwego/eino)
-[![OpenIssue](https://img.shields.io/github/issues/cloudwego/eino)](https://github.com/cloudwego/kitex/eino)
+[![OpenIssue](https://img.shields.io/github/issues/cloudwego/eino)](https://github.com/cloudwego/eino/issues)
 [![ClosedIssue](https://img.shields.io/github/issues-closed/cloudwego/eino)](https://github.com/cloudwego/eino/issues?q=is%3Aissue+is%3Aclosed)
 ![Stars](https://img.shields.io/github/stars/cloudwego/eino)
 ![Forks](https://img.shields.io/github/forks/cloudwego/eino)
@@ -22,7 +22,7 @@ Eino provides:
 - **Composition**: connect components into graphs and workflows that can run standalone or be exposed as tools for agents.
 - **[Examples](https://github.com/cloudwego/eino-examples)**: working code for common patterns and real-world use cases.
 
-![](.github/static/img/eino/eino_concept.jpeg)
+![](.github/static/img/eino/eino_project_structure_and_modules.png)
 
 # Quick Start
 
@@ -157,7 +157,7 @@ Any agent or tool can pause execution for human input and resume from checkpoint
 
 # Framework Structure
 
-![](.github/static/img/eino/eino_framework.jpeg)
+![](.github/static/img/eino/eino_architecture_overview.png)
 
 The Eino framework consists of:
 

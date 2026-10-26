@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -628,14 +627,30 @@ func newReadFileTool(fs filesystem.Backend, name string, desc string) (tool.Base
 			return fmt.Sprintf("No content found at path: %s", input.FilePath), nil
 		}
 
-		return formatLineNumbers(fileCt.Content, input.Offset), nil
+		return formatReadResult(fileCt.Content, input.FilePath, input.Offset), nil
 	})
+}
+
+// formatReadResult renders file content with line numbers, or an explanatory
+// message when the read produced no content at all. Backends report an Offset
+// past the last line as empty content rather than an error, and empty files are
+// legitimately empty; in both cases numbering would emit a single bogus line
+// (e.g. "   300\t") that reads as if the file contained the offset value.
+func formatReadResult(content, filePath string, startLine int) string {
+	if content == "" {
+		return fmt.Sprintf("No content read from %s: the file is empty, or offset %d is past its last line", filePath, startLine)
+	}
+	return formatLineNumbers(content, startLine)
 }
 
 // formatLineNumbers prefixes each line of content with a 1-based line number
 // starting at startLine (e.g. "     1\tfoo"). startLine corresponds to the
 // line number of the first line in content (usually ReadRequest.Offset).
+// Empty content yields an empty string rather than one blank numbered line.
 func formatLineNumbers(content string, startLine int) string {
+	if content == "" {
+		return ""
+	}
 	lines := strings.Split(content, "\n")
 	var b strings.Builder
 	for i, line := range lines {
@@ -779,7 +794,7 @@ func newMultiModalReadFileTool(fs filesystem.Backend, name string, desc string) 
 		}
 
 		return &schema.ToolResult{
-			Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: formatLineNumbers(fileCt.Content, input.Offset)}},
+			Parts: []schema.ToolOutputPart{{Type: schema.ToolPartTypeText, Text: formatReadResult(fileCt.Content, input.FilePath, input.Offset)}},
 		}, nil
 	})
 }
@@ -873,6 +888,7 @@ func newGlobTool(fs filesystem.Backend, name string, desc string) (tool.BaseTool
 		for _, fi := range infos {
 			paths = append(paths, fi.Path)
 		}
+		sort.Strings(paths)
 		return strings.Join(paths, "\n"), nil
 	})
 }
@@ -976,7 +992,10 @@ func newGrepTool(fs filesystem.Backend, name string, desc string) (tool.BaseTool
 		}
 
 		sort.SliceStable(matches, func(i, j int) bool {
-			return filepath.Base(matches[i].Path) < filepath.Base(matches[j].Path)
+			if matches[i].Path != matches[j].Path {
+				return matches[i].Path < matches[j].Path
+			}
+			return matches[i].Line < matches[j].Line
 		})
 
 		switch input.OutputMode {
